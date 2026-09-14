@@ -125,7 +125,7 @@ for f_hr in forecast_hours:
       f'lev_10_m_above_ground=on&var_UGRD=on&var_VGRD=on&'
       f'lev_mean_sea_level=on&var_PRMSL=on&'
       f'lev_850_mb=on&var_ABSV=on&'
-      f'subregion=&toplat=47&leftlon=83&rightlon=180&bottomlat=0&'
+      f'subregion=&toplat=47&leftlon=87&rightlon=180&bottomlat=0&'
       f'dir=%2Fgfs.{date_str}%2F{cycle}%2Fatmos'
   )
   grib_file = f'gfs_f{f_str}.grib2'
