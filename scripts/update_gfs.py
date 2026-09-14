@@ -18,12 +18,12 @@ def get_latest_gfs_info():
     cycle = f'{(hour // 6) * 6:02d}'
 
     # Link test sự tồn tại của bản tin
-    url_test = (
-        f'https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?'
-        f'file=gfs.t{cycle}z.pgrb2.0p25.f000&lev_10_m_above_ground=on&var_UGRD=on&'
-        f'subregion=&toplat=50&leftlon=90&rightlon=180&bottomlat=0&'
-        f'dir=%2Fgfs.{date_str}%2F{cycle}%2Fatmos'
-    )
+  url_test = (
+    f'https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?'
+    f'file=gfs.t{cycle}z.pgrb2.0p25.f000&lev_10_m_above_ground=on&var_UGRD=on&'
+    f'subregion=&toplat=47&leftlon=83&rightlon=180&bottomlat=0&'
+    f'dir=%2Fgfs.{date_str}%2F{cycle}%2Fatmos'
+)
     if requests.head(url_test).status_code == 200:
       return date_str, cycle
 
