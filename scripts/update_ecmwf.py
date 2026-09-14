@@ -67,7 +67,7 @@ forecast_steps = [0, 3, 6, 9, 12, 15, 18, 21, 24]
 time_series_data = []
 
 # Phạm vi khu vực Tây Bắc Thái Bình Dương: [N, W, S, E]
-area_crop = [50, 90, 0, 180]
+area_crop = [47, 83, 0, 180]
 
 for step in forecast_steps:
   grib_filename = f'ecmwf_step_{step}.grib2'
