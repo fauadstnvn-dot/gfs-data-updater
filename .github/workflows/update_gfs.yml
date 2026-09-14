@@ -1,37 +1,53 @@
-name: Auto Update GFS Wind Data
+name: Update Weather Data (GFS & ECMWF)
 
 on:
   schedule:
-    # Chạy tự động 4 lần mỗi ngày lúc 03:30, 09:30, 15:30, 21:30 UTC
-    - cron: '30 3,9,15,21 * * *'
-  workflow_dispatch: # Cho phép bấm nút chạy thủ công để test bất kỳ lúc nào
+    # Chạy tự động mỗi 6 tiếng một lần (vào các phút thứ 15 của khung giờ 0, 6, 12, 18 UTC)
+    - cron: '15 0,6,12,18 * * *'
+  workflow_dispatch: # Cho phép nhấn nút "Run workflow" thủ công trên giao diện GitHub Actions
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20 # Tự động ngắt nếu tác vụ chạy quá 20 phút
 
     steps:
+      # Bước 1: Checkout mã nguồn repository về máy ảo
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Khởi tạo môi trường Python 3.10
-        uses: actions/setup-python@v4
+      # Bước 2: Cài đặt Python 3.10
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Cài đặt hệ thống thư viện C & Python
+      # Bước 3: Cài đặt thư viện hệ thống ecCodes (Cần thiết để cfgrib đọc file GRIB2)
+      - name: Install System Dependencies (ecCodes)
         run: |
-          sudo apt-get update && sudo apt-get install -y libeccodes-dev
-          pip install xarray cfgrib requests eccodes
+          sudo apt-get update
+          sudo apt-get install -y libeccodes-dev
 
-      - name: Chạy Script chuyển đổi GFS sang JSON
+      # Bước 4: Cài đặt các thư viện Python
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests xarray cfgrib numpy ecmwf-opendata
+
+      # Bước 5: Chạy Script xử lý dữ liệu GFS
+      - name: Run GFS Processing Script
         run: python scripts/update_gfs.py
 
-      - name: Tự động Upload file JSON lên Host qua FTP
-        uses: SamKirkland/FTP-Deploy-Action@v4.3.4
+      # Bước 6: Chạy Script xử lý dữ liệu ECMWF
+      - name: Run ECMWF Processing Script
+        run: python scripts/update_ecmwf.py
+
+      # Bước 7: Tự động Upload toàn bộ thư mục public/data chứa file JSON lên FTP Server/Webhost
+      - name: FTP Deploy JSON Data to Webhost
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
         with:
           server: ${{ secrets.FTP_SERVER }}
           username: ${{ secrets.FTP_USERNAME }}
           password: ${{ secrets.FTP_PASSWORD }}
-          local-dir: public/data/
-          server-dir: /nangmua.vn/json_gfs/ # Thư mục chứa file JSON trên Host của bạn
+          local-dir: ./public/data/
+          server-dir: /nangmua.vn/json_gfs/
