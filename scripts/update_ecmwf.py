@@ -188,10 +188,28 @@ def classify_system(max_wind_kt, min_mslp):
         return {"type": "SEVERE_TROPICAL_STORM", "label": "Bão mạnh", "category": 3, "beaufort": beaufort, "beaufort_label": beaufort_label, "color": "#eab308"}
     elif max_wind_kt >= 34:
         return {"type": "TROPICAL_STORM", "label": "Bão nhiệt đới", "category": 2, "beaufort": beaufort, "beaufort_label": beaufort_label, "color": "#3b82f6"}
-    elif max_wind_kt >= 22 or min_mslp <= 1004.0:
+    elif max_wind_kt >= 22:
+        # Chỉ dựa vào sức gió duy trì tối đa để phân loại ATNĐ (chuẩn khí tượng),
+        # KHÔNG dùng áp suất min_mslp - áp thấp nóng trên đất liền mùa hè cũng có
+        # thể xuống dưới 1004 hPa dù gió chỉ 2-5 m/s.
         return {"type": "TROPICAL_DEPRESSION", "label": "Áp thấp nhiệt đới", "category": 1, "beaufort": beaufort, "beaufort_label": beaufort_label, "color": "#06b6d4"}
     else:
         return {"type": "LOW_PRESSURE", "label": "Vùng áp thấp", "category": 0, "beaufort": beaufort, "beaufort_label": beaufort_label, "color": "#64748b"}
+
+
+def is_deep_inland(lat, lon):
+    """
+    Bộ lọc hình học đơn giản (không dùng land/sea mask đầy đủ) để loại các tâm
+    nằm quá sâu trong lục địa châu Á - nơi xoáy thuận nhiệt đới không thể hình
+    thành/duy trì (thường chỉ là "áp thấp nóng" - heat low bị nhận nhầm):
+      - Nam Á / Ấn Độ, xa biển (68-88°E, 8-35°N)
+      - Cao nguyên Tây Tạng & nội địa Trung Quốc, xa biển (78-105°E, >= 20°N)
+    """
+    if 8.0 <= lat <= 35.0 and 68.0 <= lon <= 88.0:
+        return True
+    if lat >= 20.0 and 78.0 <= lon <= 105.0:
+        return True
+    return False
 
 
 def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
@@ -396,7 +414,12 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
             except Exception:
                 pass
 
-        if (max_wind_ms >= 10.0 or p_min_local <= 1003.0) and is_warm_core and is_moist:
+        # Bắt buộc phải có gió mạnh tối thiểu của một ATNĐ (~10 m/s / 20kt) để
+        # được công nhận - không cho áp suất thấp (heat low trên đất liền) tự
+        # nó "vượt cửa" như trước (toán tử `or`). Đồng thời loại các tâm nằm
+        # quá sâu trong lục địa châu Á (Ấn Độ, Tây Tạng, nội địa Trung Quốc).
+        if (max_wind_ms >= 10.0 and p_min_local <= 1008.0 and is_warm_core and is_moist
+                and not is_deep_inland(center_lat, center_lon)):
             sys_info = classify_system(max_wind_kts, p_min_local)
             detected.append({
                 "lat": round(float(center_lat), 2),
