@@ -62,12 +62,18 @@ def detect_cyclones(mslp_grid, u10_grid, v10_grid, lats, lons):
 print('-> Bắt đầu kết nối tải dữ liệu ECMWF Open Data...')
 client = Client(source='ecmwf', model='ifs', resol='0p25')
 
-# Các mốc dự báo ECMWF (0h đến 24h, bước nhảy 3 tiếng)
-forecast_steps = [0, 3, 6, 9, 12, 15, 18, 21, 24]
-time_series_data = []
+# Các mốc dự báo ECMWF IFS 0.25° (stream=oper, type=fc) — lấy TỐI ĐA tất cả các mốc:
+#   - Run 00z & 12z: 0 -> 144 giờ mỗi 3 giờ, 150 -> 360 giờ mỗi 6 giờ (tổng 85 mốc).
+#   - Run 06z & 18z: chỉ có 0 -> 144 giờ mỗi 3 giờ (các mốc 150+ sẽ bị bỏ qua).
+forecast_steps = list(range(0, 145, 3)) + list(range(150, 361, 6))
+manifest = []   # danh sách {forecastTime, forecastHour, file} cho PHP nạp từng mốc
 
 # Phạm vi khu vực Tây Bắc Thái Bình Dương: [N, W, S, E]
 area_crop = [47, 83, 0, 180]
+
+# Thư mục xuất dữ liệu (mỗi mốc 1 file + manifest).
+output_dir = 'public/data'
+os.makedirs(output_dir, exist_ok=True)
 
 for step in forecast_steps:
   grib_filename = f'ecmwf_step_{step}.grib2'
@@ -103,7 +109,7 @@ for step in forecast_steps:
     # Quét bão
     cyclones = detect_cyclones(mslp, u10, v10, lats, lons)
 
-    time_series_data.append({
+    step_data = {
         'forecastTime': valid_time,
         'forecastHour': step,
         'cyclonesDetected': cyclones,
@@ -166,6 +172,16 @@ for step in forecast_steps:
                 ],
             },
         ],
+    }
+
+    # Ghi mỗi mốc ra 1 file JSON riêng (tránh 1 file quá lớn gây tràn bộ nhớ khi đọc).
+    step_file = f'ecmwf_nwp_f{step:03d}.json'
+    with open(os.path.join(output_dir, step_file), 'w') as f:
+        json.dump(step_data, f)
+    manifest.append({
+        'forecastTime': valid_time,
+        'forecastHour': step,
+        'file': step_file,
     })
 
     ds.close()
@@ -175,12 +191,9 @@ for step in forecast_steps:
   except Exception as e:
     print(f'❌ Lỗi mốc ECMWF step {step}: {e}')
 
-# Xuất ra file json riêng cho ECMWF
-output_dir = 'public/data'
-os.makedirs(output_dir, exist_ok=True)
-output_filepath = os.path.join(output_dir, 'ecmwf_nwp_timeseries.json')
+# Xuất manifest (danh sách các mốc + file tương ứng) cho PHP nạp từng mốc.
+manifest_filepath = os.path.join(output_dir, 'ecmwf_nwp_manifest.json')
+with open(manifest_filepath, 'w') as f:
+  json.dump(manifest, f)
 
-with open(output_filepath, 'w') as f:
-  json.dump(time_series_data, f)
-
-print(f'✅ ĐÃ XUẤT THÀNH CÔNG ECMWF JSON: {output_filepath}')
+print(f'✅ ĐÃ XUẤT THÀNH CÔNG {len(manifest)} FILE ECMWF + MANIFEST: {manifest_filepath}')
