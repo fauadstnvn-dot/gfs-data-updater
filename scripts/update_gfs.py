@@ -128,8 +128,14 @@ def check_closed_circulation(u_grid, v_grid, lats, lons, r_idx, c_idx,
             if r_s < 0 or r_s >= ny or c_s < 0 or c_s >= nx:
                 continue
 
-            u_s = float(u_grid[r_s, c_s])
-            v_s = float(v_grid[r_s, c_s])
+            # Lấy trung bình một cụm 3x3 ô lưới quanh điểm mẫu (thay vì 1 pixel đơn
+            # lẻ) để chống nhiễu địa hình (topographic eddy) - gió giật cục bộ khi
+            # luồng gió thẳng va vào núi/đồi dễ tạo ra 1-2 ô lưới có hướng "giả xoáy"
+            # nhưng trung bình cụm sẽ triệt tiêu nhiễu này.
+            r_lo, r_hi = max(0, r_s - 1), min(ny, r_s + 2)
+            c_lo, c_hi = max(0, c_s - 1), min(nx, c_s + 2)
+            u_s = float(np.nanmean(u_grid[r_lo:r_hi, c_lo:c_hi]))
+            v_s = float(np.nanmean(v_grid[r_lo:r_hi, c_lo:c_hi]))
             if math.isnan(u_s) or math.isnan(v_s):
                 continue
 
@@ -367,14 +373,20 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
                     continue
                 max_vort = float(np.nanmax(sub_vort))
                 # Ngưỡng xoáy thuận nhiệt đới tối thiểu chuẩn WMO (~2.0 x 10^-5 s^-1)
-                if max_vort < 2.0e-5:
+                # Nâng ngưỡng từ 2.0e-5 lên 3.5e-5: áp thấp địa hình (topographic low)
+                # trên đất liền có thể sinh độ xoáy cục bộ nhưng không đạt cường độ
+                # của một xoáy thuận nhiệt đới thực thụ ở 850hPa.
+                if max_vort < 3.5e-5:
                     continue
                 v_idx = np.unravel_index(np.nanargmax(sub_vort), sub_vort.shape)
                 r_vort = max(0, r - 3) + v_idx[0]
                 c_vort = max(0, c - 3) + v_idx[1]
 
             # LỚP 4: Hoàn lưu khép kín 360° (đa bán kính)
-            if not check_closed_circulation(u10_grid, v10_grid, lats, lons, r, c):
+            # Kiểm tra quanh tâm gió xoáy (r_vort, c_vort) thay vì tâm MSLP (r, c) -
+            # với bão mới hình thành / bị đứt gió, tâm áp suất và tâm động lực
+            # thường lệch 30-80km, quét quanh tâm MSLP dễ bỏ sót bão thật.
+            if not check_closed_circulation(u10_grid, v10_grid, lats, lons, r_vort, c_vort):
                 continue
 
             candidates.append((r, c, p_val, r_vort, c_vort))
@@ -495,14 +507,18 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
             except Exception as e:
                 print(f"[warm core check error]: {e}")
 
-        # Loại xoáy hoàn toàn lạnh ở TẤT CẢ các tầng kiểm tra được (ngoại nhiệt đới)
-        if warm_core_layers_checked > 0 and warm_core_layers_positive == 0 and center_lat > 25.0:
+        # Loại xoáy hoàn toàn lạnh (xoáy ngoại nhiệt đới, rãnh gió mùa lạnh).
+        # Bỏ điều kiện center_lat > 25.0: mọi xoáy thuận nhiệt đới thật đều PHẢI
+        # có Warm Core ở mọi vĩ độ - không khí lạnh mùa thu/đông có thể thâm
+        # nhập tới 15-20°N (Biển Đông) nên chặn theo vĩ độ để lọt xoáy lạnh qua.
+        if warm_core_layers_checked > 0 and warm_core_layers_positive == 0:
             is_warm_core = False
 
-        # Không có độ xoáy dương ở 850hPa tại tâm -> không đạt chuẩn xoáy thuận nhiệt đới
+        # Đảm bảo khu vực trung tâm vẫn giữ được độ xoáy dương rõ rệt (không bị
+        # phân rã) - yêu cầu > 1.0e-5 thay vì chỉ > 0 để loại xoáy yếu/nhiễu.
         if vort850 is not None:
             sub_vort_center = vort850[max(0, r0 - 3):min(ny, r0 + 4), max(0, c0 - 3):min(nx, c0 + 4)]
-            if sub_vort_center.size > 0 and np.nanmax(sub_vort_center) <= 0:
+            if sub_vort_center.size > 0 and np.nanmax(sub_vort_center) <= 1.0e-5:
                 is_warm_core = False
 
         # --- Kiểm tra Độ ẩm 700hPa nếu có (lọc xoáy khô) ---
@@ -614,27 +630,38 @@ for f_hr in forecast_hours:
         # 2. Đọc các tầng khí áp trên cao để tính toán tâm bão (chỉ xử lý trong RAM tại GitHub)
         u850, v850, t200, t300, t250, w500, rh700 = None, None, None, None, None, None, None
         try:
-            ds_isobaric = xr.open_dataset(grib_file, engine="cfgrib", filter_by_keys={"typeOfLevel": "isobaricInhPa"})
-            levels_available = ds_isobaric.isobaricInhPa.values
-            # U, V ở 850 hPa (định vị xoáy)
-            if "u" in ds_isobaric and 850 in levels_available:
-                u850 = ds_isobaric["u"].sel(isobaricInhPa=850).values
-                v850 = ds_isobaric["v"].sel(isobaricInhPa=850).values
-            # Nhiệt độ T ở 300/250/200 hPa (kiểm tra Warm Core đa tầng)
-            if "t" in ds_isobaric:
-                if 300 in levels_available:
-                    t300 = ds_isobaric["t"].sel(isobaricInhPa=300).values - 273.15
-                if 250 in levels_available:
-                    t250 = ds_isobaric["t"].sel(isobaricInhPa=250).values - 273.15
-                if 200 in levels_available:
-                    t200 = ds_isobaric["t"].sel(isobaricInhPa=200).values - 273.15  # Kelvin -> Celsius
-            # Vận tốc thẳng đứng w ở 500 hPa
-            if "w" in ds_isobaric and 500 in levels_available:
-                w500 = ds_isobaric["w"].sel(isobaricInhPa=500).values
-            # Độ ẩm tương đối RH ở 700 hPa
-            if "r" in ds_isobaric and 700 in levels_available:
-                rh700 = ds_isobaric["r"].sel(isobaricInhPa=700).values
-            ds_isobaric.close()
+            # Dùng open_datasets (số nhiều) thay vì open_dataset: khi các biến U/V/T/W/RH
+            # có số lượng level isobaricInhPa khác nhau, cfgrib không gộp được thành một
+            # DataArray chung và toàn bộ dataset "chết ngầm" (rơi vào except bên dưới),
+            # khiến mọi biến tầng cao đều thành None dù dữ liệu vẫn có trong file GRIB.
+            datasets = xr.open_datasets(grib_file, engine="cfgrib")
+            for ds_iso in datasets:
+                if "isobaricInhPa" not in ds_iso.coords:
+                    continue
+                levels_available = (
+                    list(ds_iso.isobaricInhPa.values)
+                    if ds_iso.isobaricInhPa.ndim > 0
+                    else [float(ds_iso.isobaricInhPa.values)]
+                )
+                # U, V ở 850 hPa (định vị xoáy)
+                if "u" in ds_iso and 850 in levels_available:
+                    u850 = ds_iso["u"].sel(isobaricInhPa=850).values
+                    v850 = ds_iso["v"].sel(isobaricInhPa=850).values
+                # Nhiệt độ T ở 300/250/200 hPa (kiểm tra Warm Core đa tầng)
+                if "t" in ds_iso:
+                    if 300 in levels_available:
+                        t300 = ds_iso["t"].sel(isobaricInhPa=300).values - 273.15
+                    if 250 in levels_available:
+                        t250 = ds_iso["t"].sel(isobaricInhPa=250).values - 273.15
+                    if 200 in levels_available:
+                        t200 = ds_iso["t"].sel(isobaricInhPa=200).values - 273.15  # Kelvin -> Celsius
+                # Vận tốc thẳng đứng w ở 500 hPa
+                if "w" in ds_iso and 500 in levels_available:
+                    w500 = ds_iso["w"].sel(isobaricInhPa=500).values
+                # Độ ẩm tương đối RH ở 700 hPa
+                if "r" in ds_iso and 700 in levels_available:
+                    rh700 = ds_iso["r"].sel(isobaricInhPa=700).values
+                ds_iso.close()
         except Exception as e:
             # Fallback nếu grib chia thành file con hoặc một số tầng chưa có
             print(f"Lưu ý: Không tải được tầng cao f{f_str} ({e}), dùng trường bề mặt + gradient áp suất để định vị.")
