@@ -360,7 +360,7 @@ def classify_system(max_wind_kt, min_mslp):
     elif max_wind_kt >= 64:
         return {
             "type": "TYPHOON",
-            "label": "Bão rất mạnh (Cuồng phong)",
+            "label": "B��o rất mạnh (Cuồng phong)",
             "category": 4,
             "beaufort": beaufort,
             "beaufort_label": beaufort_label,
@@ -975,6 +975,111 @@ def _polygon_centroid(coords):
     return cx / (6.0 * area), cy / (6.0 * area)
 
 
+def _refine_grid(grid, lat_list, lon_list, factor):
+    """
+    Port 1:1 của refine_grid() bên testt.php: nội suy SONG TUYẾN (bilinear) làm
+    mịn lưới, tăng độ phân giải lên `factor` lần. ĐỒNG BỘ QUAN TRỌNG: bên PHP,
+    các đường đẳng áp vẽ trên bản đồ (và dùng để lọc nhiễu tâm bão) được chạy
+    marching squares trên lưới ĐÃ refine_grid + gaussian, KHÔNG phải lưới gốc.
+    Nếu Python bỏ bước này, hình dạng/diện tích/trọng tâm vòng khép kín sẽ khác
+    -> ngưỡng "thuộc về" và lọc bán kính lõi 300km lệch khỏi PHP.
+
+    Trả về (refined_grid[j][i] dạng np.array, new_lats, new_lons). Ô có NaN ở 1
+    trong 4 góc -> NaN (giống PHP trả null).
+    """
+    n_lat = len(lat_list)
+    n_lon = len(lon_list)
+    if factor <= 1 or n_lat < 2 or n_lon < 2:
+        return np.array(grid, dtype=float), np.array(lat_list, dtype=float), np.array(lon_list, dtype=float)
+
+    r_lat = (n_lat - 1) * factor + 1
+    r_lon = (n_lon - 1) * factor + 1
+
+    new_lat = np.empty(r_lat, dtype=float)
+    j0_arr = np.empty(r_lat, dtype=int)
+    tj_arr = np.empty(r_lat, dtype=float)
+    for a in range(r_lat):
+        fj = a / factor
+        j0 = int(math.floor(fj))
+        tj = fj - j0
+        if j0 >= n_lat - 1:
+            j0 = n_lat - 2
+            tj = 1.0
+        j0_arr[a] = j0
+        tj_arr[a] = tj
+        new_lat[a] = lat_list[j0] + (lat_list[j0 + 1] - lat_list[j0]) * tj
+
+    new_lon = np.empty(r_lon, dtype=float)
+    i0_arr = np.empty(r_lon, dtype=int)
+    ti_arr = np.empty(r_lon, dtype=float)
+    for b in range(r_lon):
+        fi = b / factor
+        i0 = int(math.floor(fi))
+        ti = fi - i0
+        if i0 >= n_lon - 1:
+            i0 = n_lon - 2
+            ti = 1.0
+        i0_arr[b] = i0
+        ti_arr[b] = ti
+        new_lon[b] = lon_list[i0] + (lon_list[i0 + 1] - lon_list[i0]) * ti
+
+    g = np.array(grid, dtype=float)
+    out = np.full((r_lat, r_lon), np.nan, dtype=float)
+    for a in range(r_lat):
+        j0 = j0_arr[a]
+        tj = tj_arr[a]
+        for b in range(r_lon):
+            i0 = i0_arr[b]
+            ti = ti_arr[b]
+            v00 = g[j0, i0]
+            v01 = g[j0, i0 + 1]
+            v10 = g[j0 + 1, i0]
+            v11 = g[j0 + 1, i0 + 1]
+            if np.isnan(v00) or np.isnan(v01) or np.isnan(v10) or np.isnan(v11):
+                continue
+            top = v00 + (v01 - v00) * ti
+            bot = v10 + (v11 - v10) * ti
+            out[a, b] = top + (bot - top) * tj
+    return out, new_lat, new_lon
+
+
+def _chaikin(path, iterations, closed):
+    """
+    Port 1:1 của chaikin() bên testt.php: bo góc Chaikin (corner-cutting) làm
+    đường đẳng áp cong mềm. Áp dụng cho từng vòng khép kín TRƯỚC khi tính diện
+    tích/trọng tâm/point-in-polygon, đúng như PHP (features đã qua chaikin mới
+    được đưa vào refine_cyclone_centers).
+    """
+    path = [list(p) for p in path]
+    if iterations <= 0 or len(path) < 3:
+        return path
+    if closed and path and path[0] == path[-1]:
+        path.pop()
+    for _ in range(iterations):
+        n = len(path)
+        if n < 3:
+            break
+        new = []
+        if closed:
+            for k in range(n):
+                p0 = path[k]
+                p1 = path[(k + 1) % n]
+                new.append([0.75 * p0[0] + 0.25 * p1[0], 0.75 * p0[1] + 0.25 * p1[1]])
+                new.append([0.25 * p0[0] + 0.75 * p1[0], 0.25 * p0[1] + 0.75 * p1[1]])
+        else:
+            new.append(path[0])
+            for k in range(n - 1):
+                p0 = path[k]
+                p1 = path[k + 1]
+                new.append([0.75 * p0[0] + 0.25 * p1[0], 0.75 * p0[1] + 0.25 * p1[1]])
+                new.append([0.25 * p0[0] + 0.75 * p1[0], 0.25 * p0[1] + 0.75 * p1[1]])
+            new.append(path[n - 1])
+        path = new
+    if closed:
+        path.append(path[0])
+    return path
+
+
 def _point_in_polygon(lon, lat, coords):
     n = len(coords)
     inside = False
@@ -1011,12 +1116,23 @@ def _polygon_area_km2(coords, lat_ref):
 
 
 def _closed_polygons_near(smooth_grid, lats, lons, center_lat, center_lon,
-                           window_deg=7.0, level_step=2.0, level_cap=1011.0):
+                           window_deg=7.0, level_step=2.0,
+                           refine_factor=2, chaikin_iters=2):
     """
-    Tìm mọi đường đẳng áp KHÉP KÍN (marching squares, đúng CONTOUR_INTERVAL=2hPa
-    dùng bên PHP) trong 1 CỬA SỔ CỤC BỘ quanh (center_lat, center_lon), thay vì
-    quét toàn lưới - vì 1 xoáy thuận chỉ có thể có vòng khép kín thuộc về nó
-    trong bán kính vài độ quanh tâm, giúp chạy nhanh dù có nhiều tâm/mốc giờ.
+    Tìm mọi đường đẳng áp KHÉP KÍN trong 1 CỬA SỔ CỤC BỘ quanh (center_lat,
+    center_lon). Đồng bộ HOÀN TOÀN với pipeline vẽ isobar bên testt.php:
+
+        gaussian_smooth -> refine_grid (bilinear x REFINE_FACTOR) ->
+        marching_squares (mỗi CONTOUR_INTERVAL=2hPa) -> chaikin (CHAIKIN_ITERS=2)
+
+    Trước đây Python bỏ hai bước refine_grid + chaikin nên vòng khép kín có hình
+    dạng/diện tích/trọng tâm khác PHP -> điều kiện "thuộc về" và ngưỡng lọc nhiễu
+    bán kính lõi 300km cho kết quả lệch. Nay chạy đúng cùng pipeline để đồng bộ.
+
+    Quét cục bộ (không quét toàn lưới) vì 1 xoáy thuận chỉ có vòng khép kín thuộc
+    về nó trong bán kính vài độ quanh tâm -> nhanh dù nhiều tâm/mốc giờ. Mức
+    (level) chạy từ ceil(local_min/step)*step tới floor(local_max/step)*step,
+    giống PHP dùng ceil(minP)/floor(maxP) trên vùng dữ liệu.
     """
     lat_step = float(lats[1] - lats[0]) if len(lats) > 1 else -0.25
     lon_step = float(lons[1] - lons[0]) if len(lons) > 1 else 0.25
@@ -1041,13 +1157,20 @@ def _closed_polygons_near(smooth_grid, lats, lons, center_lat, center_lon,
     sub_lats = lats[j_min:j_max]
     sub_lons = lons[i_min:i_max]
 
+    # Nội suy song tuyến làm mịn lưới TRƯỚC khi chạy marching squares - giống PHP.
+    sub, sub_lats, sub_lons = _refine_grid(sub, sub_lats, sub_lons, refine_factor)
+
     valid = sub[~np.isnan(sub)]
     if valid.size == 0:
         return []
     local_min = float(np.min(valid))
+    local_max = float(np.max(valid))
 
-    start_level = math.floor(local_min / level_step) * level_step
-    levels = np.arange(start_level, level_cap + 1e-6, level_step)
+    start_level = math.ceil(local_min / level_step) * level_step
+    end_level = math.floor(local_max / level_step) * level_step
+    if end_level < start_level:
+        return []
+    levels = np.arange(start_level, end_level + 1e-6, level_step)
 
     polys = []
     for level in levels:
@@ -1057,7 +1180,8 @@ def _closed_polygons_near(smooth_grid, lats, lons, center_lat, center_lon,
         for p in _stitch_segments(segs):
             if not p["closed"] or len(p["path"]) < 4:
                 continue
-            coords = p["path"]
+            # Bo góc Chaikin đúng như PHP trước khi tính diện tích/trọng tâm.
+            coords = _chaikin(p["path"], chaikin_iters, True)
             area = abs(_polygon_signed_area(coords))
             if area <= 1e-6:
                 continue
@@ -1378,7 +1502,7 @@ manifest_data = {
 with open(os.path.join(output_dir, "gfs_nwp_manifest.json"), "w", encoding="utf-8") as f:
     json.dump(manifest_data, f, ensure_ascii=False)
 
-# File tóm tắt riêng cho bão để nạp siêu nhanh
+# File tóm tắt riêng cho bão để n��p siêu nhanh
 with open(os.path.join(output_dir, "gfs_cyclones_summary.json"), "w", encoding="utf-8") as f:
     json.dump(all_cyclones_summary, f, ensure_ascii=False)
 
