@@ -1115,85 +1115,71 @@ def _polygon_area_km2(coords, lat_ref):
     return abs(area) / 2.0
 
 
-def _closed_polygons_near(smooth_grid, lats, lons, center_lat, center_lon,
-                           window_deg=7.0, level_step=2.0,
-                           refine_factor=2, chaikin_iters=2):
+def _build_closed_polygons(mslp_grid, lats, lons,
+                           sigma=1.0, radius=2, refine_factor=2,
+                           contour_interval=2.0, chaikin_iters=2):
     """
-    Tìm mọi đường đẳng áp KHÉP KÍN trong 1 CỬA SỔ CỤC BỘ quanh (center_lat,
-    center_lon). Đồng bộ HOÀN TOÀN với pipeline vẽ isobar bên testt.php:
+    Port 1:1 của bước dựng $features trong compute_frame() bên testt.php:
 
-        gaussian_smooth -> refine_grid (bilinear x REFINE_FACTOR) ->
-        marching_squares (mỗi CONTOUR_INTERVAL=2hPa) -> chaikin (CHAIKIN_ITERS=2)
+        gaussian_smooth (TOÀN LƯỚI) -> refine_grid (bilinear x REFINE_FACTOR,
+        TOÀN LƯỚI) -> marching_squares tại mỗi mức CONTOUR_INTERVAL=2hPa từ
+        ceil(minP/interval)*interval tới floor(maxP/interval)*interval ->
+        stitch_segments -> chaikin (CHAIKIN_ITERS=2).
 
-    Trước đây Python bỏ hai bước refine_grid + chaikin nên vòng khép kín có hình
-    dạng/diện tích/trọng tâm khác PHP -> điều kiện "thuộc về" và ngưỡng lọc nhiễu
-    bán kính lõi 300km cho kết quả lệch. Nay chạy đúng cùng pipeline để đồng bộ.
-
-    Quét cục bộ (không quét toàn lưới) vì 1 xoáy thuận chỉ có vòng khép kín thuộc
-    về nó trong bán kính vài độ quanh tâm -> nhanh dù nhiều tâm/mốc giờ. Mức
-    (level) chạy từ ceil(local_min/step)*step tới floor(local_max/step)*step,
-    giống PHP dùng ceil(minP)/floor(maxP) trên vùng dữ liệu.
+    Trả về TẤT CẢ vòng đẳng áp KHÉP KÍN của cả frame (đã bo góc Chaikin) kèm
+    diện tích + trọng tâm + bán kính hiệu dụng, dựng ĐÚNG 1 LẦN rồi dùng chung
+    cho mọi tâm bão - giống hệt PHP dựng $features 1 lần rồi truyền vào
+    refine_cyclone_centers(). Trước đây Python quét CỬA SỔ CỤC BỘ quanh từng
+    tâm với ngưỡng mức (level) theo min/max cục bộ -> có thể chọn vòng trong
+    cùng khác PHP ở rìa miền hoặc khi vòng vượt ra ngoài cửa sổ. Nay quét toàn
+    lưới với dải mức theo minP/maxP TOÀN CỤC để khớp tuyệt đối với PHP.
     """
-    lat_step = float(lats[1] - lats[0]) if len(lats) > 1 else -0.25
-    lon_step = float(lons[1] - lons[0]) if len(lons) > 1 else 0.25
-    if lat_step == 0:
-        lat_step = -0.25
-    if lon_step == 0:
-        lon_step = 0.25
-
-    j_span = max(4, int(round(window_deg / abs(lat_step))))
-    i_span = max(4, int(round(window_deg / abs(lon_step))))
-
-    j0 = int(round((center_lat - float(lats[0])) / lat_step))
-    i0 = int(round((center_lon - float(lons[0])) / lon_step))
-
-    ny, nx = smooth_grid.shape
-    j_min, j_max = max(0, j0 - j_span), min(ny, j0 + j_span + 1)
-    i_min, i_max = max(0, i0 - i_span), min(nx, i0 + i_span + 1)
-    if j_max - j_min < 3 or i_max - i_min < 3:
-        return []
-
-    sub = smooth_grid[j_min:j_max, i_min:i_max]
-    sub_lats = lats[j_min:j_max]
-    sub_lons = lons[i_min:i_max]
-
-    # Nội suy song tuyến làm mịn lưới TRƯỚC khi chạy marching squares - giống PHP.
-    sub, sub_lats, sub_lons = _refine_grid(sub, sub_lats, sub_lons, refine_factor)
-
-    valid = sub[~np.isnan(sub)]
+    g = np.array(mslp_grid, dtype=float)
+    valid = g[~np.isnan(g)]
     if valid.size == 0:
         return []
-    local_min = float(np.min(valid))
-    local_max = float(np.max(valid))
+    # minP/maxP lấy trên LƯỚI GỐC (trước làm mịn) đúng như PHP tính $minP/$maxP.
+    min_p = float(np.min(valid))
+    max_p = float(np.max(valid))
 
-    start_level = math.ceil(local_min / level_step) * level_step
-    end_level = math.floor(local_max / level_step) * level_step
+    smooth = gaussian_smooth_separable(g, sigma=sigma, radius=radius)
+    refined, ref_lats, ref_lons = _refine_grid(smooth, lats, lons, refine_factor)
+
+    # startLevel = (int)ceil(minP/interval)*interval ; endLevel = (int)floor(...)
+    start_level = int(math.ceil(min_p / contour_interval)) * contour_interval
+    end_level = int(math.floor(max_p / contour_interval)) * contour_interval
     if end_level < start_level:
         return []
-    levels = np.arange(start_level, end_level + 1e-6, level_step)
 
     polys = []
-    for level in levels:
-        segs = _marching_squares_segments(sub, sub_lats, sub_lons, float(level))
+    n_levels = int(round((end_level - start_level) / contour_interval)) + 1
+    for k in range(n_levels):
+        level = start_level + k * contour_interval
+        segs = _marching_squares_segments(refined, ref_lats, ref_lons, float(level))
         if not segs:
             continue
         for p in _stitch_segments(segs):
-            if not p["closed"] or len(p["path"]) < 4:
+            path = p["path"]
+            if len(path) < 2:
                 continue
-            # Bo góc Chaikin đúng như PHP trước khi tính diện tích/trọng tâm.
-            coords = _chaikin(p["path"], chaikin_iters, True)
+            closed = p["closed"]
+            # Bo góc Chaikin đúng như PHP (áp dụng cho mọi path trước khi lọc).
+            coords = _chaikin(path, chaikin_iters, closed)
+            if not closed or len(coords) < 4:
+                continue
             area = abs(_polygon_signed_area(coords))
-            if area <= 1e-6:
+            if area <= 0:
                 continue
             clon, clat = _polygon_centroid(coords)
-            polys.append({"coords": coords, "area": area, "clat": clat, "clon": clon})
+            r_eff = math.sqrt(area / math.pi)
+            polys.append({"coords": coords, "area": area,
+                          "clat": clat, "clon": clon, "r_eff": r_eff})
     return polys
 
 
 def refine_and_filter_cyclones_by_closed_isobars(cyclones, mslp_grid, lats, lons,
                                                     contour_interval=2.0, max_snap_deg=3.0,
-                                                    max_core_radius_km=300.0,
-                                                    window_deg=7.0):
+                                                    max_core_radius_km=300.0):
     """
     Port 1:1 của refine_cyclone_centers() bên testt.php - chạy ngay tại GitHub
     thay vì trên trang web. Với mỗi tâm bão báo cáo:
@@ -1218,7 +1204,13 @@ def refine_and_filter_cyclones_by_closed_isobars(cyclones, mslp_grid, lats, lons
     if not cyclones:
         return cyclones
 
-    smooth = gaussian_smooth_separable(mslp_grid, sigma=1.0, radius=2)
+    # Dựng TẤT CẢ vòng đẳng áp khép kín của cả frame ĐÚNG 1 LẦN trên TOÀN LƯỚI
+    # (giống PHP dựng $features rồi truyền vào refine_cyclone_centers) thay vì
+    # quét cửa sổ cục bộ quanh từng tâm.
+    closed_polys = _build_closed_polygons(mslp_grid, lats, lons,
+                                          contour_interval=contour_interval)
+    if not closed_polys:
+        return cyclones
 
     result = []
     for cyc in cyclones:
@@ -1228,18 +1220,15 @@ def refine_and_filter_cyclones_by_closed_isobars(cyclones, mslp_grid, lats, lons
             continue
         lat0, lon0 = float(cyc["lat"]), float(cyc["lon"])
 
-        polys = _closed_polygons_near(smooth, lats, lons, lat0, lon0,
-                                       window_deg=window_deg, level_step=contour_interval)
-
-        # Vòng đẳng áp khép kín NHỎ NHẤT (diện tích bé nhất) "thuộc về" tâm.
+        # Vòng đẳng áp khép kín NHỎ NHẤT (diện tích bé nhất) "thuộc về" tâm,
+        # xét trên TOÀN BỘ vòng khép kín của frame - đúng như PHP.
         best = None
         best_area = math.inf
-        for poly in polys:
+        for poly in closed_polys:
             if poly["area"] >= best_area:
                 continue
-            r_eff = math.sqrt(poly["area"] / math.pi)
             dist = math.hypot(poly["clat"] - lat0, poly["clon"] - lon0)
-            tol = max(0.35, r_eff * 1.4)
+            tol = max(0.35, poly["r_eff"] * 1.4)
             belongs = (dist <= tol) or _point_in_polygon(lon0, lat0, poly["coords"])
             if belongs:
                 best_area = poly["area"]
@@ -1254,8 +1243,11 @@ def refine_and_filter_cyclones_by_closed_isobars(cyclones, mslp_grid, lats, lons
 
             d = math.hypot(best["clat"] - lat0, best["clon"] - lon0)
             if d <= max_snap_deg:
-                cyc["lat"] = round(best["clat"], 2)
-                cyc["lon"] = round(best["clon"], 2)
+                # Đồng bộ CHÍNH XÁC với PHP refine_cyclone_centers(): round(,3)
+                # (không phải round(,2)) để toạ độ tâm bão Python ghi ra JSON
+                # khớp 100% với kết quả tinh chỉnh phía PHP.
+                cyc["lat"] = round(best["clat"], 3)
+                cyc["lon"] = round(best["clon"], 3)
 
         result.append(cyc)
 
