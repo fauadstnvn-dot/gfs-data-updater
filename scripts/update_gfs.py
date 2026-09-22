@@ -28,7 +28,11 @@ def get_latest_gfs_info():
 date_str, cycle = get_latest_gfs_info()
 print(f'-> GFS Date: {date_str} - Cycle: {cycle}Z')
 
-forecast_hours = [0, 3, 6, 9, 12, 15, 18, 21, 24]
+# GFS 0.25° cung cấp dự báo tới 384 giờ (16 ngày).
+# Lấy tất cả các mốc dự báo cách nhau 12 tiếng: 0, 12, 24, ..., 384.
+MAX_FORECAST_HOUR = 384
+FORECAST_STEP_HOURS = 12
+forecast_hours = list(range(0, MAX_FORECAST_HOUR + 1, FORECAST_STEP_HOURS))
 time_series_data = []
 base_time = datetime.datetime.strptime(f'{date_str}{cycle}', '%Y%m%d%H')
 
