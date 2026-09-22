@@ -777,6 +777,335 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
 
 
 # ==============================================================================
+# LỌC NHIỄU + KÉO TÂM VÀO ĐÚNG TRỌNG TÂM ĐƯỜNG ĐẲNG ÁP KHÉP KÍN
+# (chạy ngay tại GitHub Action, TRƯỚC KHI xuất JSON)
+# ------------------------------------------------------------------------------
+# TRƯỚC ĐÂY: trang hiển thị (testt.php) phải tự vẽ marching squares và chạy
+# refine_cyclone_centers() MỖI LẦN TẢI TRANG để: (1) loại các tâm bão/ATNĐ chỉ
+# là nhiễu/vệ tinh của một hệ mạnh hơn gần đó (không có vòng đẳng áp khép kín
+# độc lập của riêng nó), và (2) kéo tâm còn lại vào đúng trọng tâm vòng đẳng áp
+# khép kín mà bản đồ thực sự vẽ ra. Việc này phải chạy lại cho TỪNG frameIndex
+# xuất hiện trong bảng theo dõi bão -> trang tải rất lâu khi có nhiều tâm.
+#
+# BÂY GIỜ: toàn bộ logic đó được PORT SANG PYTHON, chạy 1 lần tại đây cho mỗi
+# mốc dự báo, ngay khi tạo dữ liệu trên GitHub. Kết quả (cyclonesDetected +
+# all_cyclones_summary) xuất ra JSON đã ĐƯỢC LỌC SẠCH + ĐÃ ĐÚNG TOẠ ĐỘ, PHP chỉ
+# cần đọc thẳng và hiển thị, không cần tính lại gì nữa -> trang tải nhanh.
+#
+# Các hàm dưới đây là bản port 1:1 các hàm marching_squares/stitch_segments/
+# point_in_polygon/polygon_centroid/refine_cyclone_centers bên testt.php, dùng
+# đúng CONTOUR_INTERVAL = 2 hPa và Gaussian sigma=1.0/radius=2 mà PHP dùng để
+# vẽ đường đẳng áp, để việc xác định "khép kín" ở đây LUÔN KHỚP với những gì
+# bản đồ sẽ vẽ ra.
+# ==============================================================================
+
+def gaussian_smooth_separable(grid, sigma=1.0, radius=2):
+    """
+    Bản port chính xác của hàm gaussian_smooth() bên testt.php: bộ lọc Gaussian
+    tách trục (lọc theo kinh độ trước, rồi theo vĩ độ), bỏ qua NaN và chuẩn hoá
+    lại trọng số theo số điểm hợp lệ tại từng vị trí. KHÔNG bọc vòng (no-wrap)
+    ở biên lưới - giống PHP (`if ($ii < 0 || $ii >= $nLon) continue;`), khác
+    với np.roll (có bọc vòng) nên không dùng np.roll trực tiếp.
+    """
+    if sigma <= 0 or radius <= 0:
+        return np.array(grid, dtype=float)
+
+    def _shift_no_wrap(arr, offset, axis):
+        n = arr.shape[axis]
+        result = np.full_like(arr, np.nan)
+        if offset == 0:
+            return arr.copy()
+        src_start = max(0, offset)
+        src_end = min(n, n + offset)
+        dst_start = max(0, -offset)
+        dst_end = dst_start + (src_end - src_start)
+        if src_end <= src_start:
+            return result
+        if axis == 0:
+            result[dst_start:dst_end, :] = arr[src_start:src_end, :]
+        else:
+            result[:, dst_start:dst_end] = arr[:, src_start:src_end]
+        return result
+
+    g = np.array(grid, dtype=float)
+    offsets = list(range(-radius, radius + 1))
+    weights = [math.exp(-(x * x) / (2.0 * sigma * sigma)) for x in offsets]
+    wtotal = sum(weights)
+    weights = [w / wtotal for w in weights]
+
+    def _pass(arr, axis):
+        acc = np.zeros_like(arr)
+        wsum = np.zeros_like(arr)
+        for off, w in zip(offsets, weights):
+            shifted = _shift_no_wrap(arr, off, axis)
+            valid = ~np.isnan(shifted)
+            acc[valid] += shifted[valid] * w
+            wsum[valid] += w
+        with np.errstate(invalid="ignore"):
+            return np.where(wsum > 0, acc / wsum, arr)
+
+    t = _pass(g, axis=1)   # theo trục kinh độ (cột)
+    o = _pass(t, axis=0)   # theo trục vĩ độ (dòng)
+    return o
+
+
+def _ms_interp(level, va, vb, pa, pb):
+    """Port của interp() bên PHP: nội suy vị trí điểm cắt đường đẳng áp trên 1 cạnh ô lưới."""
+    d = vb - va
+    t = 0.5 if d == 0.0 else (level - va) / d
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    return (pa[0] + t * (pb[0] - pa[0]), pa[1] + t * (pb[1] - pa[1]))
+
+
+def _marching_squares_segments(grid, lats, lons, level):
+    """Port của marching_squares() bên PHP, chạy trên 1 sub-grid cục bộ [j][i]."""
+    ny, nx = grid.shape
+    segs = []
+    for j in range(ny - 1):
+        lat0 = float(lats[j]); lat1 = float(lats[j + 1])
+        for i in range(nx - 1):
+            v0 = grid[j, i]; v1 = grid[j, i + 1]
+            v2 = grid[j + 1, i + 1]; v3 = grid[j + 1, i]
+            if np.isnan(v0) or np.isnan(v1) or np.isnan(v2) or np.isnan(v3):
+                continue
+            lon0 = float(lons[i]); lon1 = float(lons[i + 1])
+            p0 = (lon0, lat0); p1 = (lon1, lat0)
+            p2 = (lon1, lat1); p3 = (lon0, lat1)
+            edges = {}
+            if (v0 >= level) != (v1 >= level):
+                edges[0] = _ms_interp(level, v0, v1, p0, p1)
+            if (v1 >= level) != (v2 >= level):
+                edges[1] = _ms_interp(level, v1, v2, p1, p2)
+            if (v2 >= level) != (v3 >= level):
+                edges[2] = _ms_interp(level, v2, v3, p2, p3)
+            if (v3 >= level) != (v0 >= level):
+                edges[3] = _ms_interp(level, v3, v0, p3, p0)
+            keys = list(edges.keys())
+            if len(keys) == 2:
+                segs.append((edges[keys[0]], edges[keys[1]]))
+            elif len(keys) == 4:
+                center = (v0 + v1 + v2 + v3) / 4.0
+                if center >= level:
+                    segs.append((edges[3], edges[0]))
+                    segs.append((edges[1], edges[2]))
+                else:
+                    segs.append((edges[0], edges[1]))
+                    segs.append((edges[2], edges[3]))
+    return segs
+
+
+def _stitch_segments(segs):
+    """Port của stitch_segments() bên PHP: nối các đoạn thẳng rời rạc thành đường/vòng khép kín."""
+    def qkey(p):
+        return (round(p[0], 6), round(p[1], 6))
+
+    adj = {}
+    for s_idx, seg in enumerate(segs):
+        adj.setdefault(qkey(seg[0]), []).append(s_idx)
+        adj.setdefault(qkey(seg[1]), []).append(s_idx)
+
+    used = [False] * len(segs)
+    paths = []
+
+    def other_end(seg, key):
+        return (qkey(seg[1]), seg[1]) if qkey(seg[0]) == key else (qkey(seg[0]), seg[0])
+
+    def find_next(key):
+        for s_idx in adj.get(key, []):
+            if not used[s_idx]:
+                return s_idx
+        return -1
+
+    for start in range(len(segs)):
+        if used[start]:
+            continue
+        used[start] = True
+        seg = segs[start]
+        path = [seg[0], seg[1]]
+        head_key, tail_key = qkey(seg[0]), qkey(seg[1])
+
+        while True:
+            nx_idx = find_next(tail_key)
+            if nx_idx < 0:
+                break
+            used[nx_idx] = True
+            k, pt = other_end(segs[nx_idx], tail_key)
+            path.append(pt)
+            tail_key = k
+            if tail_key == head_key:
+                break
+        while True:
+            nx_idx = find_next(head_key)
+            if nx_idx < 0:
+                break
+            used[nx_idx] = True
+            k, pt = other_end(segs[nx_idx], head_key)
+            path.insert(0, pt)
+            head_key = k
+            if tail_key == head_key:
+                break
+
+        if len(path) >= 2:
+            paths.append({"path": path, "closed": tail_key == head_key})
+    return paths
+
+
+def _polygon_signed_area(coords):
+    n = len(coords)
+    a = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        a += coords[i][0] * coords[j][1] - coords[j][0] * coords[i][1]
+    return a / 2.0
+
+
+def _polygon_centroid(coords):
+    n = len(coords)
+    area = _polygon_signed_area(coords)
+    if abs(area) < 1e-9:
+        sx = sum(p[0] for p in coords) / n
+        sy = sum(p[1] for p in coords) / n
+        return sx, sy
+    cx = cy = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        cross = coords[i][0] * coords[j][1] - coords[j][0] * coords[i][1]
+        cx += (coords[i][0] + coords[j][0]) * cross
+        cy += (coords[i][1] + coords[j][1]) * cross
+    return cx / (6.0 * area), cy / (6.0 * area)
+
+
+def _point_in_polygon(lon, lat, coords):
+    n = len(coords)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = coords[i]
+        xj, yj = coords[j]
+        denom = (yj - yi) or 1e-12
+        if (yi > lat) != (yj > lat) and lon < (xj - xi) * (lat - yi) / denom + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _closed_polygons_near(smooth_grid, lats, lons, center_lat, center_lon,
+                           window_deg=7.0, level_step=2.0, level_cap=1011.0):
+    """
+    Tìm mọi đường đẳng áp KHÉP KÍN (marching squares, đúng CONTOUR_INTERVAL=2hPa
+    dùng bên PHP) trong 1 CỬA SỔ CỤC BỘ quanh (center_lat, center_lon), thay vì
+    quét toàn lưới - vì 1 xoáy thuận chỉ có thể có vòng khép kín thuộc về nó
+    trong bán kính vài độ quanh tâm, giúp chạy nhanh dù có nhiều tâm/mốc giờ.
+    """
+    lat_step = float(lats[1] - lats[0]) if len(lats) > 1 else -0.25
+    lon_step = float(lons[1] - lons[0]) if len(lons) > 1 else 0.25
+    if lat_step == 0:
+        lat_step = -0.25
+    if lon_step == 0:
+        lon_step = 0.25
+
+    j_span = max(4, int(round(window_deg / abs(lat_step))))
+    i_span = max(4, int(round(window_deg / abs(lon_step))))
+
+    j0 = int(round((center_lat - float(lats[0])) / lat_step))
+    i0 = int(round((center_lon - float(lons[0])) / lon_step))
+
+    ny, nx = smooth_grid.shape
+    j_min, j_max = max(0, j0 - j_span), min(ny, j0 + j_span + 1)
+    i_min, i_max = max(0, i0 - i_span), min(nx, i0 + i_span + 1)
+    if j_max - j_min < 3 or i_max - i_min < 3:
+        return []
+
+    sub = smooth_grid[j_min:j_max, i_min:i_max]
+    sub_lats = lats[j_min:j_max]
+    sub_lons = lons[i_min:i_max]
+
+    valid = sub[~np.isnan(sub)]
+    if valid.size == 0:
+        return []
+    local_min = float(np.min(valid))
+
+    start_level = math.floor(local_min / level_step) * level_step
+    levels = np.arange(start_level, level_cap + 1e-6, level_step)
+
+    polys = []
+    for level in levels:
+        segs = _marching_squares_segments(sub, sub_lats, sub_lons, float(level))
+        if not segs:
+            continue
+        for p in _stitch_segments(segs):
+            if not p["closed"] or len(p["path"]) < 4:
+                continue
+            coords = p["path"]
+            area = abs(_polygon_signed_area(coords))
+            if area <= 1e-6:
+                continue
+            clon, clat = _polygon_centroid(coords)
+            polys.append({"coords": coords, "area": area, "clat": clat, "clon": clon})
+    return polys
+
+
+def refine_and_filter_cyclones_by_closed_isobars(cyclones, mslp_grid, lats, lons,
+                                                    contour_interval=2.0, max_snap_deg=3.0,
+                                                    window_deg=7.0):
+    """
+    Port của refine_cyclone_centers() bên testt.php - chạy ngay tại GitHub thay
+    vì trên trang web. Xử lý các tâm THEO THỨ TỰ MẠNH -> YẾU (áp thấp nhất
+    trước). Với mỗi tâm, tìm vòng đẳng áp khép kín NHỎ NHẤT "thuộc về" nó
+    (bao quanh nó, hoặc trọng tâm vòng gần nó trong bán kính hiệu dụng*1.4) mà
+    CHƯA bị một tâm mạnh hơn đã được xác nhận trước đó "chiếm" (nằm trong vòng
+    đó). Nếu tìm được -> kéo (lat, lon) của tâm vào đúng trọng tâm vòng đó (khi
+    độ lệch không quá xa, <= max_snap_deg). Nếu KHÔNG tìm được vòng khép kín
+    độc lập nào -> đây là NHIỄU/VỆ TINH của một hệ mạnh hơn gần đó -> LOẠI khỏi
+    kết quả.
+    """
+    if not cyclones:
+        return cyclones
+
+    smooth = gaussian_smooth_separable(mslp_grid, sigma=1.0, radius=2)
+
+    order = sorted(range(len(cyclones)), key=lambda i: cyclones[i].get("min_mslp_hpa", 9999.0))
+    accepted_points = []
+    kept = {}
+
+    for idx in order:
+        cyc = dict(cyclones[idx])
+        lat0, lon0 = float(cyc["lat"]), float(cyc["lon"])
+
+        polys = _closed_polygons_near(smooth, lats, lons, lat0, lon0,
+                                       window_deg=window_deg, level_step=contour_interval)
+
+        belong = []
+        for poly in polys:
+            r_eff = math.sqrt(poly["area"] / math.pi)
+            dist = math.hypot(poly["clat"] - lat0, poly["clon"] - lon0)
+            tol = max(0.35, r_eff * 1.4)
+            if dist <= tol or _point_in_polygon(lon0, lat0, poly["coords"]):
+                belong.append(poly)
+        belong.sort(key=lambda p: p["area"])
+
+        chosen = None
+        for poly in belong:
+            occupied = any(_point_in_polygon(ap[1], ap[0], poly["coords"]) for ap in accepted_points)
+            if not occupied:
+                chosen = poly
+                break
+
+        if chosen is None:
+            continue  # Nhiễu / vệ tinh của hệ mạnh hơn gần đó -> loại
+
+        d = math.hypot(chosen["clat"] - lat0, chosen["clon"] - lon0)
+        if d <= max_snap_deg:
+            cyc["lat"] = round(chosen["clat"], 2)
+            cyc["lon"] = round(chosen["clon"], 2)
+
+        accepted_points.append((cyc["lat"], cyc["lon"]))
+        kept[idx] = cyc
+
+    return [kept[i] for i in range(len(cyclones)) if i in kept]
+
+
+# ==============================================================================
 # CHƯƠNG TRÌNH CHÍNH GFS
 # ==============================================================================
 date_str, cycle = get_latest_gfs_info()
@@ -899,7 +1228,13 @@ for f_hr in forecast_hours:
 
         # 3. TÍNH TOÁN VỊ TRÍ TÂM BÃO & THÔNG SỐ VẬT LÝ TẠI GITHUB
         cyclones = detect_cyclones_full(mslp, u10, v10, lats, lons, u850, v850, t200, t300, t250, w500, rh700, orog=orog)
-        
+
+        # 3b. LỌC NHIỄU + KÉO TÂM VÀO ĐÚNG TRỌNG TÂM ĐƯỜNG ĐẲNG ÁP KHÉP KÍN,
+        # ngay tại đây (xem giải thích chi tiết ở refine_and_filter_cyclones_by_closed_isobars()).
+        # Nhờ vậy JSON xuất ra (cyclonesDetected + all_cyclones_summary) đã sạch
+        # + đúng toạ độ, trang PHP không cần tính lại việc này mỗi lần tải trang.
+        cyclones = refine_and_filter_cyclones_by_closed_isobars(cyclones, mslp, lats, lons)
+
         # Đưa vào danh sách tổng hợp
         frame_idx = len(manifest)
         for cyc in cyclones:
