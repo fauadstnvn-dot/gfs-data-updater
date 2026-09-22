@@ -989,6 +989,27 @@ def _point_in_polygon(lon, lat, coords):
     return inside
 
 
+def _polygon_area_km2(coords, lat_ref):
+    """
+    Port của polygon_area_km2() bên testt.php: diện tích vòng đẳng áp khép kín
+    quy đổi ra km², có tính co lại của kinh độ theo cos(latitude) - để so với
+    ngưỡng bán kính lõi bằng km (max_core_radius_km) giống hệt PHP, thay vì chỉ
+    dùng diện tích độ² (deg²) như trước.
+    """
+    km_per_deg_lat = 111.0
+    km_per_deg_lon = 111.0 * math.cos(math.radians(lat_ref))
+    n = len(coords)
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        xi = coords[i][0] * km_per_deg_lon
+        yi = coords[i][1] * km_per_deg_lat
+        xj = coords[j][0] * km_per_deg_lon
+        yj = coords[j][1] * km_per_deg_lat
+        area += xi * yj - xj * yi
+    return abs(area) / 2.0
+
+
 def _closed_polygons_near(smooth_grid, lats, lons, center_lat, center_lon,
                            window_deg=7.0, level_step=2.0, level_cap=1011.0):
     """
@@ -1047,62 +1068,74 @@ def _closed_polygons_near(smooth_grid, lats, lons, center_lat, center_lon,
 
 def refine_and_filter_cyclones_by_closed_isobars(cyclones, mslp_grid, lats, lons,
                                                     contour_interval=2.0, max_snap_deg=3.0,
+                                                    max_core_radius_km=300.0,
                                                     window_deg=7.0):
     """
-    Port của refine_cyclone_centers() bên testt.php - chạy ngay tại GitHub thay
-    vì trên trang web. Xử lý các tâm THEO THỨ TỰ MẠNH -> YẾU (áp thấp nhất
-    trước). Với mỗi tâm, tìm vòng đẳng áp khép kín NHỎ NHẤT "thuộc về" nó
-    (bao quanh nó, hoặc trọng tâm vòng gần nó trong bán kính hiệu dụng*1.4) mà
-    CHƯA bị một tâm mạnh hơn đã được xác nhận trước đó "chiếm" (nằm trong vòng
-    đó). Nếu tìm được -> kéo (lat, lon) của tâm vào đúng trọng tâm vòng đó (khi
-    độ lệch không quá xa, <= max_snap_deg). Nếu KHÔNG tìm được vòng khép kín
-    độc lập nào -> đây là NHIỄU/VỆ TINH của một hệ mạnh hơn gần đó -> LOẠI khỏi
-    kết quả.
+    Port 1:1 của refine_cyclone_centers() bên testt.php - chạy ngay tại GitHub
+    thay vì trên trang web. Với mỗi tâm bão báo cáo:
+
+      1. Tìm vòng đẳng áp khép kín NHỎ NHẤT (trong cùng) "thuộc về" tâm đó -
+         "thuộc về" khi tâm nằm hẳn trong vòng (point-in-polygon) HOẶC khoảng
+         cách tới trọng tâm vòng <= bán kính hiệu dụng * 1.4 (tối thiểu 0.35°).
+      2. LỌC NHIỄU (đồng bộ với PHP): nếu vòng khép kín trong cùng đó có bán
+         kính hiệu dụng quy ra KM vượt max_core_radius_km (mặc định 300km ~
+         đường kính 600km, lớn hơn cả bán kính gió mạnh cấp 6-7 của siêu bão
+         thật) -> không tồn tại lõi áp thấp CHẶT gần tâm -> coi là NHIỄU
+         (mesovortex / cực tiểu áp yếu lọt trong hoàn lưu ngoài rộng của hệ
+         khác) và LOẠI HẲN tâm này khỏi kết quả.
+      3. Nếu vòng lõi đủ chặt -> kéo (lat, lon) của tâm vào đúng trọng tâm hình
+         học vòng đó, miễn độ lệch không quá xa (<= max_snap_deg).
+
+    Giống PHP: nếu KHÔNG tìm được vòng khép kín nào "thuộc về" tâm thì GIỮ
+    NGUYÊN tâm (không kéo, không loại) - việc loại nhiễu chỉ dựa trên ngưỡng
+    bán kính lõi ở bước 2, không dựa trên cơ chế "đã bị hệ mạnh hơn chiếm" như
+    bản Python cũ (khác PHP nên đã gây lệch kết quả).
     """
     if not cyclones:
         return cyclones
 
     smooth = gaussian_smooth_separable(mslp_grid, sigma=1.0, radius=2)
 
-    order = sorted(range(len(cyclones)), key=lambda i: cyclones[i].get("min_mslp_hpa", 9999.0))
-    accepted_points = []
-    kept = {}
-
-    for idx in order:
-        cyc = dict(cyclones[idx])
+    result = []
+    for cyc in cyclones:
+        cyc = dict(cyc)
+        if "lat" not in cyc or "lon" not in cyc:
+            result.append(cyc)
+            continue
         lat0, lon0 = float(cyc["lat"]), float(cyc["lon"])
 
         polys = _closed_polygons_near(smooth, lats, lons, lat0, lon0,
                                        window_deg=window_deg, level_step=contour_interval)
 
-        belong = []
+        # Vòng đẳng áp khép kín NHỎ NHẤT (diện tích bé nhất) "thuộc về" tâm.
+        best = None
+        best_area = math.inf
         for poly in polys:
+            if poly["area"] >= best_area:
+                continue
             r_eff = math.sqrt(poly["area"] / math.pi)
             dist = math.hypot(poly["clat"] - lat0, poly["clon"] - lon0)
             tol = max(0.35, r_eff * 1.4)
-            if dist <= tol or _point_in_polygon(lon0, lat0, poly["coords"]):
-                belong.append(poly)
-        belong.sort(key=lambda p: p["area"])
+            belongs = (dist <= tol) or _point_in_polygon(lon0, lat0, poly["coords"])
+            if belongs:
+                best_area = poly["area"]
+                best = poly
 
-        chosen = None
-        for poly in belong:
-            occupied = any(_point_in_polygon(ap[1], ap[0], poly["coords"]) for ap in accepted_points)
-            if not occupied:
-                chosen = poly
-                break
+        if best is not None:
+            # LỌC NHIỄU theo bán kính lõi (km) - giống hệt PHP.
+            core_area_km2 = _polygon_area_km2(best["coords"], lat0)
+            core_radius_km = math.sqrt(core_area_km2 / math.pi)
+            if core_radius_km > max_core_radius_km:
+                continue  # bỏ hẳn tâm nhiễu khỏi kết quả
 
-        if chosen is None:
-            continue  # Nhiễu / vệ tinh của hệ mạnh hơn gần đó -> loại
+            d = math.hypot(best["clat"] - lat0, best["clon"] - lon0)
+            if d <= max_snap_deg:
+                cyc["lat"] = round(best["clat"], 2)
+                cyc["lon"] = round(best["clon"], 2)
 
-        d = math.hypot(chosen["clat"] - lat0, chosen["clon"] - lon0)
-        if d <= max_snap_deg:
-            cyc["lat"] = round(chosen["clat"], 2)
-            cyc["lon"] = round(chosen["clon"], 2)
+        result.append(cyc)
 
-        accepted_points.append((cyc["lat"], cyc["lon"]))
-        kept[idx] = cyc
-
-    return [kept[i] for i in range(len(cyclones)) if i in kept]
+    return result
 
 
 # ==============================================================================
