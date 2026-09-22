@@ -8,6 +8,16 @@ import requests
 import xarray as xr
 
 # ==============================================================================
+# STDOUT REALTIME: trên GitHub Actions không có TTY nên Python để stdout ở chế độ
+# block-buffered -> mọi print() bị gom lại, log tưởng như "đơ" hàng phút dù script
+# vẫn đang tải/giải mã GRIB. Ép line-buffered để log chảy ra ngay từng dòng.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+# ==============================================================================
 # HỆ THỐNG DỰ BÁO VÀ THEO DÕI XOÁY THUẬN NHIỆT ĐỚI / BÃO TỰ ĐỘNG (GFS 0.25°)
 # Chạy trên GitHub Actions:
 #  1. Tải các tầng:
@@ -360,7 +370,7 @@ def classify_system(max_wind_kt, min_mslp):
     elif max_wind_kt >= 64:
         return {
             "type": "TYPHOON",
-            "label": "B����o rất mạnh (Cuồng phong)",
+            "label": "B������o rất mạnh (Cuồng phong)",
             "category": 4,
             "beaufort": beaufort,
             "beaufort_label": beaufort_label,
@@ -1271,6 +1281,7 @@ def refine_and_filter_cyclones_by_closed_isobars(cyclones, mslp_grid, lats, lons
 # ==============================================================================
 # CHƯƠNG TRÌNH CHÍNH GFS
 # ==============================================================================
+print("-> Khởi động script. Đang dò chu kỳ GFS mới nhất trên NOMADS (HEAD request)...")
 date_str, cycle = get_latest_gfs_info()
 print(f"-> GFS Date: {date_str} - Cycle: {cycle}Z")
 
