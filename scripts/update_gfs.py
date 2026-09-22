@@ -360,7 +360,7 @@ def classify_system(max_wind_kt, min_mslp):
     elif max_wind_kt >= 64:
         return {
             "type": "TYPHOON",
-            "label": "B��o rất mạnh (Cuồng phong)",
+            "label": "B����o rất mạnh (Cuồng phong)",
             "category": 4,
             "beaufort": beaufort,
             "beaufort_label": beaufort_label,
@@ -858,16 +858,34 @@ def _ms_interp(level, va, vb, pa, pb):
 
 
 def _marching_squares_segments(grid, lats, lons, level):
-    """Port của marching_squares() bên PHP, chạy trên 1 sub-grid cục bộ [j][i]."""
+    """
+    Port của marching_squares() bên PHP, chạy trên 1 sub-grid [j][i].
+
+    TỐI ƯU (kết quả GIỮ NGUYÊN 100%): thay vì duyệt TỪNG ô lưới bằng Python cho
+    MỖI mức đẳng áp (cực chậm, gây treo job khi chạy toàn lưới × ~45 mức × 33
+    frame), ta dùng numpy để lọc trước CHỈ các ô thực sự bị đường đẳng áp cắt
+    qua, rồi mới lặp Python trên đúng các ô đó theo THỨ TỰ hàng-cột (j, i) y hệt
+    vòng lặp gốc. Các ô không có giao cắt trước đây cũng chỉ `continue`, nên bỏ
+    qua chúng cho kết quả (danh sách segment) trùng khít từng phần tử.
+    """
     ny, nx = grid.shape
     segs = []
-    for j in range(ny - 1):
+    if ny < 2 or nx < 2:
+        return segs
+
+    # Phát hiện ô có giao cắt bằng numpy (không đổi giá trị, chỉ chọn ô cần xử lý).
+    a0 = grid[:-1, :-1]; a1 = grid[:-1, 1:]
+    a2 = grid[1:, 1:];   a3 = grid[1:, :-1]
+    valid = ~(np.isnan(a0) | np.isnan(a1) | np.isnan(a2) | np.isnan(a3))
+    g0 = a0 >= level; g1 = a1 >= level; g2 = a2 >= level; g3 = a3 >= level
+    crossing = valid & ((g0 != g1) | (g1 != g2) | (g2 != g3) | (g3 != g0))
+    # argwhere trả về chỉ số đã sắp theo (hàng j, cột i) -> đúng thứ tự gốc.
+    for j, i in np.argwhere(crossing):
+        j = int(j); i = int(i)
         lat0 = float(lats[j]); lat1 = float(lats[j + 1])
-        for i in range(nx - 1):
-            v0 = grid[j, i]; v1 = grid[j, i + 1]
-            v2 = grid[j + 1, i + 1]; v3 = grid[j + 1, i]
-            if np.isnan(v0) or np.isnan(v1) or np.isnan(v2) or np.isnan(v3):
-                continue
+        v0 = grid[j, i]; v1 = grid[j, i + 1]
+        v2 = grid[j + 1, i + 1]; v3 = grid[j + 1, i]
+        if True:
             lon0 = float(lons[i]); lon1 = float(lons[i + 1])
             p0 = (lon0, lat0); p1 = (lon1, lat0)
             p2 = (lon1, lat1); p3 = (lon0, lat1)
@@ -1024,22 +1042,18 @@ def _refine_grid(grid, lat_list, lon_list, factor):
         new_lon[b] = lon_list[i0] + (lon_list[i0 + 1] - lon_list[i0]) * ti
 
     g = np.array(grid, dtype=float)
-    out = np.full((r_lat, r_lon), np.nan, dtype=float)
-    for a in range(r_lat):
-        j0 = j0_arr[a]
-        tj = tj_arr[a]
-        for b in range(r_lon):
-            i0 = i0_arr[b]
-            ti = ti_arr[b]
-            v00 = g[j0, i0]
-            v01 = g[j0, i0 + 1]
-            v10 = g[j0 + 1, i0]
-            v11 = g[j0 + 1, i0 + 1]
-            if np.isnan(v00) or np.isnan(v01) or np.isnan(v10) or np.isnan(v11):
-                continue
-            top = v00 + (v01 - v00) * ti
-            bot = v10 + (v11 - v10) * ti
-            out[a, b] = top + (bot - top) * tj
+    # Bilinear VECTOR HOÁ: từng phép tính giữ nguyên như vòng lặp gốc (chỉ nhanh
+    # hơn hàng nghìn lần). Ô có NaN ở 1 trong 4 góc -> NaN tự lan ra qua phép
+    # cộng/nhân, đúng như bản gốc (out mặc định NaN + `continue`).
+    v00 = g[np.ix_(j0_arr, i0_arr)]
+    v01 = g[np.ix_(j0_arr, i0_arr + 1)]
+    v10 = g[np.ix_(j0_arr + 1, i0_arr)]
+    v11 = g[np.ix_(j0_arr + 1, i0_arr + 1)]
+    ti_row = ti_arr[np.newaxis, :]
+    tj_col = tj_arr[:, np.newaxis]
+    top = v00 + (v01 - v00) * ti_row
+    bot = v10 + (v11 - v10) * ti_row
+    out = top + (bot - top) * tj_col
     return out, new_lat, new_lon
 
 
