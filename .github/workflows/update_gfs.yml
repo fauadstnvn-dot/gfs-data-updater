@@ -9,7 +9,7 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 20 # Tự động ngắt nếu tác vụ chạy quá 20 phút
+    timeout-minutes: 60 # Tự động ngắt nếu tác vụ chạy quá 20 phút
 
     steps:
       # Bước 1: Checkout mã nguồn repository về máy ảo
