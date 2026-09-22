@@ -82,6 +82,121 @@ def compute_relative_vorticity(u_grid, v_grid, lats, lons):
     return dv_dx - du_dy
 
 
+def smooth_grid(grid, passes=1):
+    """
+    Làm mượt nhẹ trường 2D bằng bộ lọc trung bình 3x3 (bỏ qua NaN), lặp `passes` lần.
+
+    MỤC ĐÍCH (sửa lỗi tâm bão nằm ngoài đường đẳng áp khép kín):
+      - ĐỒNG BỘ trường dùng để DÒ TÂM với trường đã làm mượt mà PHP dùng để vẽ
+        đường đẳng áp. Nhờ đó tâm bão và đường đẳng áp luôn khớp nhau; không còn
+        cảnh tâm nằm ở nơi trên bản đồ không hề có vòng đẳng áp khép kín.
+      - Triệt các cực tiểu áp suất GIẢ quy mô 1-2 ô lưới sinh ra khi mô hình quy
+        đổi (ngoại suy) áp suất mực biển xuống DƯỚI địa hình núi cao (Đài Loan,
+        Luzon, Nhật...). Một "áp thấp" chỉ tồn tại ở trường thô mà biến mất sau
+        khi làm mượt thì cũng biến mất khỏi bản đồ -> không phải tâm thật.
+    """
+    if grid is None:
+        return None
+    g = np.array(grid, dtype=float)
+    for _ in range(max(0, passes)):
+        acc = np.zeros_like(g)
+        cnt = np.zeros_like(g)
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                shifted = np.roll(np.roll(g, dr, axis=0), dc, axis=1)
+                valid = ~np.isnan(shifted)
+                acc[valid] += shifted[valid]
+                cnt[valid] += 1.0
+        with np.errstate(invalid="ignore"):
+            g = np.where(cnt > 0, acc / cnt, g)
+    return g
+
+
+def build_high_terrain_mask(orog, threshold_m=300.0):
+    """
+    Tạo mặt nạ boolean (True = địa hình cao) từ trường độ cao địa hình orography
+    (mét). Áp suất mực biển tại các ô có độ cao > threshold_m là con số NGOẠI SUY
+    xuống dưới lòng đất, thường sinh cực trị áp giả -> loại khỏi vùng dò tâm.
+    Trả về None nếu không có dữ liệu orography (khi đó dùng fallback is_high_terrain).
+    """
+    if orog is None:
+        return None
+    try:
+        arr = np.asarray(orog, dtype=float)
+        return arr > threshold_m
+    except Exception:
+        return None
+
+
+def is_high_terrain(lat, lon):
+    """
+    Fallback khi KHÔNG có trường độ cao địa hình (orography): loại thủ công các
+    dải núi cao ven biển Đông Á - nơi áp suất mực biển bị ngoại suy xuống dưới
+    mặt đất, sinh cực tiểu áp GIẢ (không phải xoáy thuận nhiệt đới thật):
+      - Dải Trung Ương Sơn (Đài Loan)
+      - Dãy Cordillera (Bắc Luzon, Philippines)
+      - Vùng núi Honshu (Nhật Bản)
+    """
+    if 22.2 <= lat <= 24.9 and 120.6 <= lon <= 121.7:   # Taiwan Central Range
+        return True
+    if 16.0 <= lat <= 18.6 and 120.5 <= lon <= 121.7:   # Luzon Cordillera
+        return True
+    if 34.5 <= lat <= 38.6 and 136.0 <= lon <= 140.6:   # Japan Alps / Honshu
+        return True
+    return False
+
+
+def symmetric_tangential_wind(u_grid, v_grid, lats, lons, center_lat, center_lon,
+                              radii_km=(50.0, 100.0, 150.0, 200.0), n_angles=24):
+    """
+    Tính GIÓ TIẾP TUYẾN ĐỐI XỨNG (azimuthal-mean tangential wind) quanh tâm -
+    thước đo mức độ QUAY THÀNH XOÁY thực sự của hệ thống.
+
+    Khác với cách cũ lấy `np.nanmax` gió trong một hộp vuông (dễ vồ nhầm luồng
+    gió mùa/gió tăng tốc do địa hình chạy MỘT CHIỀU và gán thành cường độ bão),
+    hàm này lấy TRUNG BÌNH thành phần gió tiếp tuyến theo vòng tròn quanh tâm:
+      - Xoáy thật: gió quay quanh tâm -> trung bình tiếp tuyến LỚN (> 0).
+      - Luồng gió thẳng: hai nửa vòng triệt tiêu nhau -> trung bình ~ 0.
+    Trả về (vt_sym_max_ms, rmw_km) với vt_sym_max_ms là giá trị lớn nhất theo các
+    bán kính khảo sát và rmw_km là bán kính đạt giá trị đó.
+    """
+    ny, nx = u_grid.shape
+    lat_step = float(lats[1] - lats[0]) if ny > 1 else -0.25
+    lon_step = float(lons[1] - lons[0]) if nx > 1 else 0.25
+    if lat_step == 0:
+        lat_step = -0.25
+    if lon_step == 0:
+        lon_step = 0.25
+    cos_lat = max(0.2, math.cos(math.radians(center_lat)))
+
+    best_vt = 0.0
+    best_r = radii_km[0]
+    for radius_km in radii_km:
+        vt_sum = 0.0
+        cnt = 0
+        for k in range(n_angles):
+            phi = 2.0 * math.pi * k / n_angles  # 0 = Đông, tăng ngược kim đồng hồ
+            dlat = (radius_km * math.sin(phi)) / 111.0
+            dlon = (radius_km * math.cos(phi)) / (111.0 * cos_lat)
+            r_s = int(round((center_lat + dlat - float(lats[0])) / lat_step))
+            c_s = int(round((center_lon + dlon - float(lons[0])) / lon_step))
+            if r_s < 0 or r_s >= ny or c_s < 0 or c_s >= nx:
+                continue
+            u_s = float(u_grid[r_s, c_s])
+            v_s = float(v_grid[r_s, c_s])
+            if math.isnan(u_s) or math.isnan(v_s):
+                continue
+            vt = -u_s * math.sin(phi) + v_s * math.cos(phi)  # ngược kim đồng hồ
+            vt_sum += vt
+            cnt += 1
+        if cnt >= int(n_angles * 0.6):
+            vt_mean = vt_sum / cnt
+            if vt_mean > best_vt:
+                best_vt = vt_mean
+                best_r = radius_km
+    return best_vt, best_r
+
+
 def check_closed_circulation(u_grid, v_grid, lats, lons, r_idx, c_idx,
                               radii_km=(50.0, 100.0), n_angles=16,  # bỏ bán kính 150km, dễ dính nhiễu ngoại vi
                               coverage_ratio=0.75, min_speed_ms=2.5, min_tangential_ms=1.5):
@@ -309,7 +424,7 @@ def is_deep_inland(lat, lon):
 
 def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
                          u850=None, v850=None, t200=None, t300=None, t250=None,
-                         w500=None, rh700=None):
+                         w500=None, rh700=None, orog=None):
     """
     Thuật toán định vị tâm xoáy thuận nhiệt đới đa tầng (Multi-criteria Center Detection):
 
@@ -331,7 +446,33 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
     detected = []
     ny, nx = mslp_grid.shape
     wind10 = np.sqrt(u10_grid**2 + v10_grid**2)
-    
+
+    # Trường MSLP đã làm mượt: DÙNG CHO TOÀN BỘ việc dò tâm & đo độ sâu, để tâm
+    # bão luôn khớp với đường đẳng áp (PHP cũng vẽ trên trường đã làm mượt) và
+    # để triệt cực tiểu áp giả do địa hình núi cao.
+    mslp_det = smooth_grid(mslp_grid, passes=1)
+    if mslp_det is None:
+        mslp_det = mslp_grid
+
+    # Mặt nạ địa hình cao (nếu có orography); nếu không, dùng fallback theo tọa độ.
+    terrain_high = build_high_terrain_mask(orog, threshold_m=300.0)
+
+    def _on_high_terrain(la, lo, r=None, c=None):
+        if terrain_high is not None:
+            if r is None or c is None:
+                lat_step = float(lats[1] - lats[0]) if ny > 1 else -0.25
+                lon_step = float(lons[1] - lons[0]) if nx > 1 else 0.25
+                if lat_step == 0:
+                    lat_step = -0.25
+                if lon_step == 0:
+                    lon_step = 0.25
+                r = int(round((la - float(lats[0])) / lat_step))
+                c = int(round((lo - float(lons[0])) / lon_step))
+            if 0 <= r < ny and 0 <= c < nx:
+                return bool(terrain_high[r, c])
+            return False
+        return is_high_terrain(la, lo)
+
     # 1. Tính độ xoáy 850hPa nếu có trường gió 850hPa
     vort850 = None
     if u850 is not None and v850 is not None:
@@ -351,18 +492,24 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
             continue
 
         for c in range(3, nx - 3):
-            p_val = float(mslp_grid[r, c])
+            # Loại ngay các ô nằm trên địa hình cao (áp mực biển bị ngoại suy)
+            if _on_high_terrain(float(lats[r]), float(lons[c]), r, c):
+                continue
+
+            p_val = float(mslp_det[r, c])
             if math.isnan(p_val) or p_val > 1008.5:
                 continue
 
-            sub_p = mslp_grid[max(0, r - 3):min(ny, r + 4), max(0, c - 3):min(nx, c + 4)]
+            sub_p = mslp_det[max(0, r - 3):min(ny, r + 4), max(0, c - 3):min(nx, c + 4)]
             if p_val != np.nanmin(sub_p):
                 continue  # không phải cực tiểu áp suất cục bộ
 
-            # Bắt buộc tâm khuyết áp phải sâu hơn rìa box (7x7) ít nhất 1.0 hPa -
-            # loại các vùng áp thấp thoai thoải, không có dốc áp suất (rãnh/nhiễu yếu)
+            # Bắt buộc tâm khuyết áp phải sâu hơn rìa box (7x7) ít nhất 2.0 hPa
+            # (trên trường ĐÃ LÀM MƯỢT) - tương đương phải tồn tại một đường đẳng
+            # áp khép kín thật quanh tâm. Ngưỡng 1.0 hPa cũ quá lỏng, để lọt các
+            # cực tiểu áp giả nông (đặc biệt là artifact địa hình ~1 hPa).
             edge_max = float(np.nanmax(sub_p))
-            if (edge_max - p_val) < 1.0:
+            if (edge_max - p_val) < 2.0:
                 continue
 
             # LỚP 2: Cực đại độ xoáy 850hPa quanh ứng viên
@@ -417,7 +564,7 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
         r_min, r_max = max(0, r0 - box_rad), min(ny, r0 + box_rad + 1)
         c_min, c_max = max(0, c0 - box_rad), min(nx, c0 + box_rad + 1)
         
-        sub_p = mslp_grid[r_min:r_max, c_min:c_max]
+        sub_p = mslp_det[r_min:r_max, c_min:c_max]
         p_min_local = float(np.nanmin(sub_p))
         p_threshold = min(p_min_local + 3.0, 1008.0)
         
@@ -427,7 +574,7 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
         
         for ir in range(r_min, r_max):
             for ic in range(c_min, c_max):
-                pv = mslp_grid[ir, ic]
+                pv = mslp_det[ir, ic]
                 if not math.isnan(pv) and pv <= p_threshold:
                     w = (p_threshold - pv) ** 1.5
                     lat_weighted += float(lats[ir]) * w
@@ -507,12 +654,14 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
             except Exception as e:
                 print(f"[warm core check error]: {e}")
 
-        # Loại xoáy hoàn toàn lạnh (xoáy ngoại nhiệt đới, rãnh gió mùa lạnh).
-        # Bỏ điều kiện center_lat > 25.0: mọi xoáy thuận nhiệt đới thật đều PHẢI
-        # có Warm Core ở mọi vĩ độ - không khí lạnh mùa thu/đông có thể thâm
-        # nhập tới 15-20°N (Biển Đông) nên chặn theo vĩ độ để lọt xoáy lạnh qua.
-        if warm_core_layers_checked > 0 and warm_core_layers_positive == 0:
-            is_warm_core = False
+        # Loại xoáy hoàn toàn lạnh (xoáy ngoại nhiệt đới, rãnh gió mùa lạnh) VÀ
+        # siết ngưỡng tâm nóng: yêu cầu dị thường nóng RÕ RỆT >= +0.8°C ở >= 2
+        # tầng (hoặc ở tầng duy nhất khả dụng). Ngưỡng cũ chỉ cần 1 tầng dương
+        # thoáng qua nên dị thường nhiệt tầng cao rộng của môi trường cũng lọt.
+        if warm_core_layers_checked > 0:
+            need_positive = 2 if warm_core_layers_checked >= 2 else 1
+            if warm_core_dt < 0.8 or warm_core_layers_positive < need_positive:
+                is_warm_core = False
 
         # Đảm bảo khu vực trung tâm vẫn giữ được độ xoáy dương rõ rệt (không bị
         # phân rã) - yêu cầu > 1.0e-5 thay vì chỉ > 0 để loại xoáy yếu/nhiễu.
@@ -532,16 +681,26 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
             except Exception:
                 pass
 
+        # --- Gió tiếp tuyến đối xứng: bằng chứng QUAY THÀNH XOÁY thực sự ---
+        vt_sym, vt_rmw_km = symmetric_tangential_wind(
+            u10_grid, v10_grid, lats, lons, center_lat, center_lon)
+
+        # Tâm sau tinh chỉnh có bị trôi lên địa hình cao không?
+        center_on_terrain = _on_high_terrain(center_lat, center_lon)
+
         # Điều kiện tối thiểu để ghi nhận xoáy thuận / bão / ATNĐ
-        # 1. Gió mạnh >= 10 m/s (~20 kt) BẮT BUỘC - áp suất thấp không còn đủ để
-        #    "vượt cửa" một mình (bỏ toán tử `or` cũ khiến heat low trên đất
-        #    liền bị nhận nhầm thành ATNĐ khi áp suất tụt dưới 1003 hPa)
-        # 2. Không phải xoáy ngoại nhiệt đới (cold core) và có xoáy dương 850hPa
-        # 3. Không phải vùng quá khô
-        # 4. Không nằm quá sâu trong lục địa châu Á (Ấn Độ, Tây Tạng, nội địa
-        #    Trung Quốc) - nơi xoáy thuận nhiệt đới không thể hình thành/duy trì
-        if (max_wind_ms >= 10.0 and p_min_local <= 1008.0 and is_warm_core and is_moist
-                and not is_deep_inland(center_lat, center_lon)):
+        # 1. Gió mạnh >= 10 m/s (~20 kt) BẮT BUỘC.
+        # 2. GIÓ TIẾP TUYẾN ĐỐI XỨNG >= 6 m/s: hệ thống phải THỰC SỰ QUAY quanh
+        #    tâm. Đây là điều kiện loại được ca sai trong ảnh - luồng gió mùa/gió
+        #    địa hình chạy một chiều có gió max lớn nhưng gió tiếp tuyến ~ 0.
+        # 3. Không phải xoáy ngoại nhiệt đới (cold core) và có xoáy dương 850hPa.
+        # 4. Không phải vùng quá khô.
+        # 5. Không nằm sâu trong lục địa châu Á VÀ không nằm trên địa hình núi cao
+        #    (Đài Loan, Luzon, Nhật) - nơi áp mực biển bị ngoại suy sinh tâm giả.
+        if (max_wind_ms >= 10.0 and vt_sym >= 6.0 and p_min_local <= 1008.0
+                and is_warm_core and is_moist
+                and not is_deep_inland(center_lat, center_lon)
+                and not center_on_terrain):
             sys_info = classify_system(max_wind_kts, p_min_local)
             detected.append({
                 "lat": round(float(center_lat), 2),
@@ -550,6 +709,7 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
                 "max_wind_kts": round(float(max_wind_kts), 1),
                 "max_wind_ms": round(float(max_wind_ms), 1),
                 "max_wind_kmh": round(float(max_wind_kmh), 1),
+                "vt_sym_ms": round(float(vt_sym), 1),
                 "rmw_km": round(float(rmw_km), 0),
                 "warm_core_dt": round(float(warm_core_dt), 2),
                 "beaufort": sys_info["beaufort"],
@@ -600,6 +760,7 @@ for f_hr in forecast_hours:
         f"file=gfs.t{cycle}z.pgrb2.0p25.f{f_str}&"
         f"lev_10_m_above_ground=on&var_UGRD=on&var_VGRD=on&"
         f"lev_mean_sea_level=on&var_PRMSL=on&"
+        f"lev_surface=on&var_HGT=on&"  # độ cao địa hình (orography) để lọc tâm giả trên núi
         f"lev_850_mb=on&lev_300_mb=on&lev_250_mb=on&lev_200_mb=on&lev_500_mb=on&lev_700_mb=on&"
         f"var_TMP=on&var_VVEL=on&var_RH=on&"
         f"subregion=&toplat=47&leftlon=83&rightlon=180&bottomlat=0&"
@@ -626,6 +787,23 @@ for f_hr in forecast_hours:
         mslp = ds_mslp["prmsl"].values / 100.0   # Pa -> hPa
         lats = ds_wind10["latitude"].values
         lons = ds_wind10["longitude"].values
+
+        # 1b. Đọc độ cao địa hình (orography, mét) từ trường HGT ở mặt (surface) -
+        # dùng làm mặt nạ loại tâm giả nằm trên núi cao. Nếu không có, để None và
+        # thuật toán tự dùng fallback theo tọa độ (is_high_terrain).
+        orog = None
+        for _sn in ("orog", "gh", "hgt"):
+            try:
+                ds_o = xr.open_dataset(
+                    grib_file, engine="cfgrib",
+                    filter_by_keys={"typeOfLevel": "surface", "shortName": _sn},
+                )
+                _var = list(ds_o.data_vars)[0]
+                orog = ds_o[_var].values
+                ds_o.close()
+                break
+            except Exception:
+                orog = None
 
         # 2. Đọc các tầng khí áp trên cao để tính toán tâm bão (chỉ xử lý trong RAM tại GitHub)
         u850, v850, t200, t300, t250, w500, rh700 = None, None, None, None, None, None, None
@@ -667,7 +845,7 @@ for f_hr in forecast_hours:
             print(f"Lưu ý: Không tải được tầng cao f{f_str} ({e}), dùng trường bề mặt + gradient áp suất để định vị.")
 
         # 3. TÍNH TOÁN VỊ TRÍ TÂM BÃO & THÔNG SỐ VẬT LÝ TẠI GITHUB
-        cyclones = detect_cyclones_full(mslp, u10, v10, lats, lons, u850, v850, t200, t300, t250, w500, rh700)
+        cyclones = detect_cyclones_full(mslp, u10, v10, lats, lons, u850, v850, t200, t300, t250, w500, rh700, orog=orog)
         
         # Đưa vào danh sách tổng hợp
         frame_idx = len(manifest)
