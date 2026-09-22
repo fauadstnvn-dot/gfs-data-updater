@@ -83,8 +83,8 @@ def compute_relative_vorticity(u_grid, v_grid, lats, lons):
 
 
 def check_closed_circulation(u_grid, v_grid, lats, lons, r_idx, c_idx,
-                              radii_km=(50.0, 100.0, 150.0), n_angles=16,
-                              coverage_ratio=0.7, min_speed_ms=0.5, min_tangential_ms=0.3):
+                              radii_km=(50.0, 100.0), n_angles=16,  # bỏ bán kính 150km, dễ dính nhiễu ngoại vi
+                              coverage_ratio=0.75, min_speed_ms=2.5, min_tangential_ms=1.5):
     """
     Xác nhận hoàn lưu gió khép kín 360° (ngược chiều kim đồng hồ - chuẩn xoáy
     thuận Bắc bán cầu) quanh điểm ứng viên (r_idx, c_idx).
@@ -353,6 +353,12 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
             if p_val != np.nanmin(sub_p):
                 continue  # không phải cực tiểu áp suất cục bộ
 
+            # Bắt buộc tâm khuyết áp phải sâu hơn rìa box (7x7) ít nhất 1.0 hPa -
+            # loại các vùng áp thấp thoai thoải, không có dốc áp suất (rãnh/nhiễu yếu)
+            edge_max = float(np.nanmax(sub_p))
+            if (edge_max - p_val) < 1.0:
+                continue
+
             # LỚP 2: Cực đại độ xoáy 850hPa quanh ứng viên
             r_vort, c_vort = r, c
             if vort850 is not None:
@@ -435,7 +441,7 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
         center_lon = 0.6 * centroid_lon + 0.4 * structure_lon
             
         # --- Phân tích gió 10m & RMW ---
-        wind_box = 8  # bán kính ~2 độ (~220 km)
+        wind_box = 5  # bán kính ~1.25 độ (~135 km), giữ RMW gần tâm - tránh bắt nhầm gió ngoại vi
         wb_r_min, wb_r_max = max(0, r0 - wind_box), min(ny, r0 + wind_box + 1)
         wb_c_min, wb_c_max = max(0, c0 - wind_box), min(nx, c0 + wind_box + 1)
         sub_w = wind10[wb_r_min:wb_r_max, wb_c_min:wb_c_max]
