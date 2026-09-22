@@ -33,8 +33,12 @@ print(f'-> GFS Date: {date_str} - Cycle: {cycle}Z')
 MAX_FORECAST_HOUR = 384
 FORECAST_STEP_HOURS = 12
 forecast_hours = list(range(0, MAX_FORECAST_HOUR + 1, FORECAST_STEP_HOURS))
-time_series_data = []
 base_time = datetime.datetime.strptime(f'{date_str}{cycle}', '%Y%m%d%H')
+
+# Mỗi mốc dự báo ghi ra 1 file JSON riêng (tránh 1 file quá lớn gây tràn bộ nhớ khi đọc).
+output_dir = 'public/data'
+os.makedirs(output_dir, exist_ok=True)
+manifest = []   # danh sách {forecastTime, forecastHour, file} cho PHP nạp từng mốc
 
 for f_hr in forecast_hours:
   f_str = f'{f_hr:03d}'
@@ -69,7 +73,7 @@ for f_hr in forecast_hours:
 
     frame_time = base_time + datetime.timedelta(hours=f_hr)
 
-    time_series_data.append({
+    step = {
         'forecastTime': frame_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
         'forecastHour': f_hr,
         'data': [
@@ -128,6 +132,14 @@ for f_hr in forecast_hours:
                 ],
             },
         ],
+    }
+    step_file = f'gfs_nwp_f{f_str}.json'
+    with open(os.path.join(output_dir, step_file), 'w') as f:
+        json.dump(step, f)
+    manifest.append({
+        'forecastTime': step['forecastTime'],
+        'forecastHour': f_hr,
+        'file': step_file,
     })
     ds_wind.close()
     ds_mslp.close()
@@ -135,8 +147,6 @@ for f_hr in forecast_hours:
   except Exception as e:
     print(f'Lỗi f{f_str}: {e}')
 
-output_dir = 'public/data'
-os.makedirs(output_dir, exist_ok=True)
-with open(os.path.join(output_dir, 'gfs_nwp_timeseries.json'), 'w') as f:
-  json.dump(time_series_data, f)
-print('✅ Đã xuất file JSON thành công!')
+with open(os.path.join(output_dir, 'gfs_nwp_manifest.json'), 'w') as f:
+  json.dump(manifest, f)
+print(f'✅ Đã xuất {len(manifest)} file JSON (mỗi mốc 1 file) + manifest thành công!')
