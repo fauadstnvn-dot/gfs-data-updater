@@ -82,6 +82,53 @@ def compute_relative_vorticity(u_grid, v_grid, lats, lons):
     return vort
 
 
+def check_closed_circulation(u_grid, v_grid, lats, lons, r_idx, c_idx, radius_km=130.0):
+    """
+    Kiểm tra xem điểm (r_idx, c_idx) có tạo thành một vòng xoáy gió khép kín 360 độ
+    (ngược chiều kim đồng hồ ở Bắc bán cầu) hay không.
+    Trả về: True (là xoáy khép kín) hoặc False (chỉ là rãnh thấp/nhiễu gió).
+    """
+    ny, nx = u_grid.shape
+    center_lat = float(lats[r_idx])
+
+    quadrants = [False, False, False, False]
+
+    lat_deg_rad = radius_km / 111.0
+    lon_deg_rad = radius_km / (111.0 * max(0.2, math.cos(math.radians(center_lat))))
+
+    grid_step_lat = max(1, int(round(lat_deg_rad / 0.25)))
+    grid_step_lon = max(1, int(round(lon_deg_rad / 0.25)))
+
+    lat_ascending = lats[-1] > lats[0]
+
+    # 1. Phía BẮC: gió phải thổi từ Đông sang Tây (u < 0)
+    r_north = max(0, r_idx - grid_step_lat) if not lat_ascending else min(ny - 1, r_idx + grid_step_lat)
+    u_north = u_grid[r_north, max(0, c_idx - 2):min(nx, c_idx + 3)]
+    if u_north.size > 0 and np.nanmean(u_north) < -1.5:
+        quadrants[0] = True
+
+    # 2. Phía ĐÔNG: gió phải thổi từ Nam lên Bắc (v > 0)
+    c_east = min(nx - 1, c_idx + grid_step_lon)
+    v_east = v_grid[max(0, r_idx - 2):min(ny, r_idx + 3), c_east]
+    if v_east.size > 0 and np.nanmean(v_east) > 1.5:
+        quadrants[1] = True
+
+    # 3. Phía NAM: gió phải thổi từ Tây sang Đông (u > 0)
+    r_south = min(ny - 1, r_idx + grid_step_lat) if not lat_ascending else max(0, r_idx - grid_step_lat)
+    u_south = u_grid[r_south, max(0, c_idx - 2):min(nx, c_idx + 3)]
+    if u_south.size > 0 and np.nanmean(u_south) > 1.5:
+        quadrants[2] = True
+
+    # 4. Phía TÂY: gió phải thổi từ Bắc xuống Nam (v < 0)
+    c_west = max(0, c_idx - grid_step_lon)
+    v_west = v_grid[max(0, r_idx - 2):min(ny, r_idx + 3), c_west]
+    if v_west.size > 0 and np.nanmean(v_west) < -1.5:
+        quadrants[3] = True
+
+    # Cần ít nhất 3/4 góc phần tư xoay đúng chiều mới xác nhận là xoáy khép kín
+    return sum(quadrants) >= 3
+
+
 def classify_system(max_wind_kt, min_mslp):
     """
     Phân loại cấp độ xoáy thuận nhiệt đới kết hợp thang đo Quốc Tế & thang Beaufort Việt Nam.
@@ -238,7 +285,10 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
                             has_vorticity = False
                     
                     if has_vorticity:
-                        candidates.append((r, c, p_val))
+                        # Kiểm tra vòng xoáy gió khép kín để loại rãnh áp thấp / nhiễu gió mùa
+                        is_closed = check_closed_circulation(u10_grid, v10_grid, lats, lons, r, c, radius_km=130.0)
+                        if is_closed:
+                            candidates.append((r, c, p_val))
     
     # Loại bỏ các ứng viên trùng lặp / quá gần nhau (< 300 km)
     candidates.sort(key=lambda x: x[2])  # Ưu tiên điểm áp suất thấp nhất
@@ -343,7 +393,7 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
         is_moist = True
         if rh700 is not None:
             try:
-                rh_sub = rh700[max(0, r0 - 4):min(ny, r0 + 5), max(0, c0 - 4):min(nx, c + 5)]
+                rh_sub = rh700[max(0, r0 - 4):min(ny, r0 + 5), max(0, c0 - 4):min(nx, c0 + 5)]
                 mean_rh = np.nanmean(rh_sub) if rh_sub.size > 0 else 70.0
                 if mean_rh < 45.0:  # Quá khô => không thể là xoáy thuận nhiệt đới
                     is_moist = False
