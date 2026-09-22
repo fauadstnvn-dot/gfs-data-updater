@@ -263,7 +263,10 @@ def classify_system(max_wind_kt, min_mslp):
             "beaufort_label": beaufort_label,
             "color": "#3b82f6"
         }
-    elif max_wind_kt >= 22 or min_mslp <= 1004.0:
+    elif max_wind_kt >= 22:
+        # Chỉ dựa vào sức gió duy trì tối đa để phân loại ATNĐ (chuẩn khí tượng),
+        # KHÔNG dùng áp suất min_mslp - áp thấp nóng trên đất liền mùa hè cũng có
+        # thể xuống dưới 1004 hPa dù gió chỉ 2-5 m/s.
         return {
             "type": "TROPICAL_DEPRESSION",
             "label": "Áp thấp nhiệt đới",
@@ -281,6 +284,21 @@ def classify_system(max_wind_kt, min_mslp):
             "beaufort_label": beaufort_label,
             "color": "#64748b"
         }
+
+
+def is_deep_inland(lat, lon):
+    """
+    Bộ lọc hình học đơn giản (không dùng land/sea mask đầy đủ) để loại các tâm
+    nằm quá sâu trong lục địa châu Á - nơi xoáy thuận nhiệt đới không thể hình
+    thành/duy trì (thường chỉ là "áp thấp nóng" - heat low bị nhận nhầm):
+      - Nam Á / Ấn Độ, xa biển (68-88°E, 8-35°N)
+      - Cao nguyên Tây Tạng & nội địa Trung Quốc, xa biển (78-105°E, >= 20°N)
+    """
+    if 8.0 <= lat <= 35.0 and 68.0 <= lon <= 88.0:
+        return True
+    if lat >= 20.0 and 78.0 <= lon <= 105.0:
+        return True
+    return False
 
 
 def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
@@ -493,10 +511,15 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
                 pass
 
         # Điều kiện tối thiểu để ghi nhận xoáy thuận / bão / ATNĐ
-        # 1. Gió mạnh >= 10 m/s (~cấp 5-6) HOẶC áp suất tâm <= 1003 hPa
+        # 1. Gió mạnh >= 10 m/s (~20 kt) BẮT BUỘC - áp suất thấp không còn đủ để
+        #    "vượt cửa" một mình (bỏ toán tử `or` cũ khiến heat low trên đất
+        #    liền bị nhận nhầm thành ATNĐ khi áp suất tụt dưới 1003 hPa)
         # 2. Không phải xoáy ngoại nhiệt đới (cold core) và có xoáy dương 850hPa
         # 3. Không phải vùng quá khô
-        if (max_wind_ms >= 10.0 or p_min_local <= 1003.0) and is_warm_core and is_moist:
+        # 4. Không nằm quá sâu trong lục địa châu Á (Ấn Độ, Tây Tạng, nội địa
+        #    Trung Quốc) - nơi xoáy thuận nhiệt đới không thể hình thành/duy trì
+        if (max_wind_ms >= 10.0 and p_min_local <= 1008.0 and is_warm_core and is_moist
+                and not is_deep_inland(center_lat, center_lon)):
             sys_info = classify_system(max_wind_kts, p_min_local)
             detected.append({
                 "lat": round(float(center_lat), 2),
