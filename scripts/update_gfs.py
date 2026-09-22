@@ -538,8 +538,24 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
 
             candidates.append((r, c, p_val, r_vort, c_vort))
     
-    # Loại bỏ các ứng viên trùng lặp / quá gần nhau (< 280 km)
-    candidates.sort(key=lambda x: x[2])  # Ưu tiên điểm áp suất thấp nhất
+    # Loại bỏ các ứng viên trùng lặp / vệ tinh nhiễu của một hệ thống mạnh hơn
+    # gần đó (SỬA LỖI hiện "bão vệ tinh" giả trong dải mây xoắn ngoài của bão
+    # chính, ví dụ điểm 1004 hPa lơ lửng cạnh một siêu bão/bão mạnh trên bản đồ):
+    #
+    # Ngưỡng cố định 280 km trước đây chỉ đủ để loại các ứng viên trùng lặp SÁT
+    # NHAU (cùng một tâm bị phát hiện 2 lần do lưới dò mịn). Nhưng một cơn bão
+    # mạnh có bán kính hoàn lưu ngoài (gió cấp 6-7 trở lên) rộng tới 300-600 km,
+    # đủ để sinh ra các cực tiểu áp/xoáy vệ tinh (mesovortex) cục bộ, khép kín ở
+    # bán kính nhỏ (50-100km) và có dị thường ấm nhẹ NGAY TRONG dải mây xoắn của
+    # chính nó -> lọt qua mọi lớp lọc vật lý (LỚP 2-5) dù không phải là một xoáy
+    # thuận độc lập. Một cặp bão đôi thật (Fujiwhara) thường có cường độ tương
+    # đương và cách xa nhau > 500-600 km.
+    #
+    # -> Giãn ngưỡng khoảng cách loại trùng THEO ĐỘ SÂU ÁP SUẤT của hệ thống
+    # mạnh hơn đã được chấp nhận trước đó (candidates đã sort theo áp tăng dần
+    # nên mc luôn mạnh hơn hoặc bằng ứng viên đang xét): hệ càng mạnh, vùng đệm
+    # loại vệ tinh giả xung quanh nó càng phải rộng.
+    candidates.sort(key=lambda x: x[2])  # Ưu tiên điểm áp suất thấp nhất (mạnh nhất) trước
     merged_candidates = []
     for cand in candidates:
         r0, c0, p0, r_vort, c_vort = cand
@@ -547,7 +563,9 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
         too_close = False
         for mc in merged_candidates:
             dist = math.hypot((lat0 - mc['lat']) * 111.0, (lon0 - mc['lon']) * 111.0 * math.cos(math.radians(lat0)))
-            if dist < 280.0:
+            depth_mc = max(0.0, 1010.0 - mc['p'])  # độ sâu áp suất (hPa) của hệ mạnh hơn
+            min_sep_km = 280.0 + min(320.0, depth_mc * 6.0)  # tối đa 600km với bão rất sâu
+            if dist < min_sep_km:
                 too_close = True
                 break
         if not too_close:
