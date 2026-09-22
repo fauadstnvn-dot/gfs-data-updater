@@ -38,9 +38,7 @@ jobs:
       - name: Run GFS Processing Script
         run: python scripts/update_gfs.py
 
-      # Bước 6: Chạy Script xử lý dữ liệu ECMWF
-      - name: Run ECMWF Processing Script
-        run: python scripts/update_ecmwf.py
+      
 
       # Bước 7: Tự động Upload toàn bộ thư mục public/data chứa file JSON lên FTP Server/Webhost
       - name: FTP Deploy JSON Data to Webhost
