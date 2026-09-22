@@ -539,22 +539,49 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
             candidates.append((r, c, p_val, r_vort, c_vort))
     
     # Loại bỏ các ứng viên trùng lặp / vệ tinh nhiễu của một hệ thống mạnh hơn
-    # gần đó (SỬA LỖI hiện "bão vệ tinh" giả trong dải mây xoắn ngoài của bão
-    # chính, ví dụ điểm 1004 hPa lơ lửng cạnh một siêu bão/bão mạnh trên bản đồ):
+    # gần đó (mesovortex trong dải mây xoắn ngoài của bão chính). Ngưỡng cố
+    # định 280 km chỉ đủ diệt các tâm bị dò trùng SÁT nhau; bão mạnh có hoàn
+    # lưu ngoài rộng 300-600km dư sức sinh cực tiểu áp/xoáy vệ tinh cục bộ ở xa
+    # hơn nhưng vẫn không phải một xoáy thuận độc lập. Một cặp bão đôi thật
+    # (Fujiwhara) thường cách xa nhau > 500-600 km và cường độ tương đương.
+    # -> Giãn ngưỡng loại trùng THEO ĐỘ SÂU ÁP SUẤT của hệ mạnh hơn đã được
+    # chấp nhận trước (candidates đã sort theo áp tăng dần nên mc luôn mạnh
+    # hơn hoặc bằng ứng viên đang xét).
     #
-    # Ngưỡng cố định 280 km trước đây chỉ đủ để loại các ứng viên trùng lặp SÁT
-    # NHAU (cùng một tâm bị phát hiện 2 lần do lưới dò mịn). Nhưng một cơn bão
-    # mạnh có bán kính hoàn lưu ngoài (gió cấp 6-7 trở lên) rộng tới 300-600 km,
-    # đủ để sinh ra các cực tiểu áp/xoáy vệ tinh (mesovortex) cục bộ, khép kín ở
-    # bán kính nhỏ (50-100km) và có dị thường ấm nhẹ NGAY TRONG dải mây xoắn của
-    # chính nó -> lọt qua mọi lớp lọc vật lý (LỚP 2-5) dù không phải là một xoáy
-    # thuận độc lập. Một cặp bão đôi thật (Fujiwhara) thường có cường độ tương
-    # đương và cách xa nhau > 500-600 km.
-    #
-    # -> Giãn ngưỡng khoảng cách loại trùng THEO ĐỘ SÂU ÁP SUẤT của hệ thống
-    # mạnh hơn đã được chấp nhận trước đó (candidates đã sort theo áp tăng dần
-    # nên mc luôn mạnh hơn hoặc bằng ứng viên đang xét): hệ càng mạnh, vùng đệm
-    # loại vệ tinh giả xung quanh nó càng phải rộng.
+    # SỬA LỖI TIẾP (điểm nhiễu vẫn lọt qua ở một số thời điểm): ngưỡng khoảng
+    # cách đơn thuần vẫn có thể không đủ khi 2 tâm nằm hơi xa nhau nhưng thực
+    # chất chỉ là 2 cực tiểu cục bộ (double/multiple minima) của CÙNG MỘT vùng
+    # áp thấp rộng, không có một rặng áp cao (ridge/saddle) tách biệt thật giữa
+    # chúng. Đây chính là định nghĩa khí tượng để phân biệt "2 xoáy thuận độc
+    # lập" (có yên áp/saddle cao hơn đáng kể ngăn giữa) với "1 xoáy có nhiễu
+    # cấu trúc nội tại". Bổ sung kiểm tra yên áp (saddle check): lấy giá trị
+    # MSLP lớn nhất dọc đường thẳng nối 2 tâm trên lưới đã làm mượt - nếu rặng
+    # áp cao đó không cao hơn tâm YẾU HƠN ít nhất SADDLE_MIN_HPA, coi 2 tâm là
+    # cùng một hệ thống và loại tâm yếu hơn.
+    SADDLE_MIN_HPA = 1.5
+
+    def _saddle_max_pressure(lat0, lon0, lat1, lon1):
+        lat_step = float(lats[1] - lats[0]) if ny > 1 else -0.25
+        lon_step = float(lons[1] - lons[0]) if nx > 1 else 0.25
+        if lat_step == 0:
+            lat_step = -0.25
+        if lon_step == 0:
+            lon_step = 0.25
+        dist_km = math.hypot((lat0 - lat1) * 111.0, (lon0 - lon1) * 111.0 * math.cos(math.radians((lat0 + lat1) / 2.0)))
+        n_samples = max(2, int(dist_km / 25.0))  # lấy mẫu mỗi ~25km
+        max_p = -np.inf
+        for i in range(n_samples + 1):
+            f = i / n_samples
+            la = lat0 + (lat1 - lat0) * f
+            lo = lon0 + (lon1 - lon0) * f
+            r = int(round((la - float(lats[0])) / lat_step))
+            c = int(round((lo - float(lons[0])) / lon_step))
+            if 0 <= r < ny and 0 <= c < nx:
+                v = float(mslp_det[r, c])
+                if not math.isnan(v) and v > max_p:
+                    max_p = v
+        return max_p if max_p != -np.inf else None
+
     candidates.sort(key=lambda x: x[2])  # Ưu tiên điểm áp suất thấp nhất (mạnh nhất) trước
     merged_candidates = []
     for cand in candidates:
@@ -566,6 +593,14 @@ def detect_cyclones_full(mslp_grid, u10_grid, v10_grid, lats, lons,
             depth_mc = max(0.0, 1010.0 - mc['p'])  # độ sâu áp suất (hPa) của hệ mạnh hơn
             min_sep_km = 280.0 + min(320.0, depth_mc * 6.0)  # tối đa 600km với bão rất sâu
             if dist < min_sep_km:
+                too_close = True
+                break
+            # Kiểm tra yên áp: nếu không có rặng áp cao thật ngăn giữa 2 tâm
+            # (rặng chỉ cao hơn tâm yếu hơn p0 chưa tới SADDLE_MIN_HPA), đây chỉ
+            # là nhiễu cấu trúc của cùng một vùng áp thấp -> loại tâm yếu hơn dù
+            # khoảng cách đã vượt min_sep_km.
+            saddle_p = _saddle_max_pressure(lat0, lon0, mc['lat'], mc['lon'])
+            if saddle_p is not None and (saddle_p - p0) < SADDLE_MIN_HPA:
                 too_close = True
                 break
         if not too_close:
